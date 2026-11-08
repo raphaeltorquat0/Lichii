@@ -1,0 +1,23 @@
+--- a/src/video_core/buffer_cache/buffer_cache.h
++++ b/src/video_core/buffer_cache/buffer_cache.h
+@@ -282,8 +282,18 @@
+     area->preemtive = !IsRegionGpuModified(device_addr_start_aligned,
+                                            device_addr_end_aligned - device_addr_start_aligned);
+     // A preflushable mark persists and downloads later GPU writes at every fence. Native titles
+-    // instead keep read traps and flush on demand.
+-    const bool preflush = !Tegra::g_nx2_ampere.load(std::memory_order_relaxed);
++    // instead keep read traps and flush on demand. EDEN_NX2_PREFLUSH=1 gives native titles the
++    // marks too: the first CPU read of a GPU-written page still waits for the GPU (the sync
++    // operation in GPU::OnCPURead), later reads of that page return at once with the bytes
++    // the fencing thread copied back at the last fence (QueueFenceDownload queues only the
++    // marked pages). Ocarina of Time reads GPU-written memory ~5 times a frame, and each read
++    // waited for the back to reach the request behind every command list queued before it,
++    // then for the host GPU (BufferCacheRuntime::FinishForHostRead -> Scheduler::Finish).
++    static const bool nx2_preflush = [] {
++        const char* value = std::getenv("EDEN_NX2_PREFLUSH");
++        return value != nullptr && value[0] == '1';
++    }();
++    const bool preflush = nx2_preflush || !Tegra::g_nx2_ampere.load(std::memory_order_relaxed);
+     if (!area->preemtive) {
+         if (Nx2DownloadTrace::g_enabled) [[unlikely]] {
+             Nx2DownloadTrace::Marked(device_addr_start_aligned,

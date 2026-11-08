@@ -1,0 +1,18 @@
+--- a/dist/nx2_switches.txt
++++ b/dist/nx2_switches.txt
+@@ -36,6 +36,15 @@
+ # Drop reactive-flushing read traps on Switch 2 programs (opt-in; can reduce FPS from 29 to 24 in MKW).
+ #EDEN_NX2_NO_REACTIVE=1
+ 
++# Keep the read traps but mark the pages the CPU reads for download at every fence (yuzu's
++# behaviour for Switch 1 titles): only the first read of a GPU-written page waits for the GPU.
++#EDEN_NX2_PREFLUSH=1
++
++# Semaphore acquires read the word without draining the split's back first (the back's own
++# releases still latch the waiter). Lets the front run ahead of the back while a channel waits
++# on a CPU-released semaphore (Ocarina of Time, most of every frame).
++#EDEN_NX2_ACQUIRE_NODRAIN=1
++
+ #EDEN_NX2_MME_JIT=0
+ #EDEN_NX2_PBFLUSH=0
+ #EDEN_NX2_SKIP_SAME=0

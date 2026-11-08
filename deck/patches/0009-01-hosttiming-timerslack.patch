@@ -1,0 +1,27 @@
+diff --git a/src/core/core_timing.cpp b/src/core/core_timing.cpp
+index dfc3f6f..b74ee43 100644
+--- a/src/core/core_timing.cpp
++++ b/src/core/core_timing.cpp
+@@ -14,6 +14,9 @@
+ #ifdef _WIN32
+ #include "common/windows/timer_resolution.h"
+ #endif
++#ifdef __linux__
++#include <sys/prctl.h>
++#endif
+ 
+ #include "common/settings.h"
+ #include "core/core_timing.h"
+@@ -73,6 +76,12 @@ void CoreTiming::Initialize(std::function<void()>&& on_thread_init_) {
+     if (is_multicore) {
+         timer_thread = std::jthread([this](std::stop_token stop_token) {
+             Common::SetCurrentThreadName("HostTiming");
++#ifdef __linux__
++            // Every guest timed wait (svcSleepThread, WaitSynchronization with a timeout, the
++            // vsync event) ends with this thread's WaitFor; the default timer slack adds up to
++            // 50 us to each. The GPU thread already does this (gpu_thread.cpp).
++            prctl(PR_SET_TIMERSLACK, 1UL, 0, 0, 0);
++#endif
+             Common::SetCurrentThreadPriority(Common::ThreadPriority::VeryHigh);
+             Common::SetCurrentThreadToPerformanceCores();
+             on_thread_init();

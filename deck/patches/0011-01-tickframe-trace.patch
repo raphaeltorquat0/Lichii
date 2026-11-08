@@ -1,0 +1,81 @@
+diff --git a/src/video_core/renderer_vulkan/vk_rasterizer.cpp b/src/video_core/renderer_vulkan/vk_rasterizer.cpp
+index 8fe469a..74cdcd6 100644
+--- a/src/video_core/renderer_vulkan/vk_rasterizer.cpp
++++ b/src/video_core/renderer_vulkan/vk_rasterizer.cpp
+@@ -2833,20 +2833,60 @@ void RasterizerVulkan::TickFrame() {
+     ComputePipeline::TickUpscalerTrace();
+     draw_counter = 0;
+     pending_native_work = false;
++    // EDEN_DKB_FRAME_TRACE=1: the renderer trace saw TickFrame take 6-24 ms in half of Ocarina's
++    // frames on the Steam Deck (frame_end_wall_ms), blocking the GPU thread inside Composite.
++    // Time each tick so the cost can be attributed (texture cache collector, buffer cache, ...).
++    const bool tick_trace = Common::DkbFrameTrace::Enabled();
++    std::array<std::chrono::steady_clock::time_point, 7> tick_marks{};
++    const auto mark = [&](size_t index) {
++        if (tick_trace) {
++            tick_marks[index] = std::chrono::steady_clock::now();
++        }
++    };
++    mark(0);
+     pipeline_cache.TickFrame();
++    mark(1);
+     guest_descriptor_queue.TickFrame();
+     compute_pass_descriptor_queue.TickFrame();
+     descriptor_buffer_ring.TickFrame();
++    mark(2);
+     fence_manager.TickFrame();
++    mark(3);
+     staging_pool.TickFrame();
++    mark(4);
+     {
+         std::scoped_lock lock{texture_cache.mutex};
+         texture_cache.TickFrame();
+     }
++    mark(5);
+     {
+         std::scoped_lock lock{buffer_cache.mutex};
+         buffer_cache.TickFrame();
+     }
++    mark(6);
++    if (tick_trace) {
++        for (size_t i = 0; i < 6; ++i) {
++            const double ms =
++                std::chrono::duration<double, std::milli>(tick_marks[i + 1] - tick_marks[i]).count();
++            trace_tick_sum_ms[i] += ms;
++            trace_tick_max_ms[i] = (std::max)(trace_tick_max_ms[i], ms);
++        }
++        ++trace_tick_frames;
++        if (trace_tick_rate.Ready(tick_marks[6])) {
++            LOG_INFO(Render_Vulkan,
++                     "DKB tick frames={} pipeline_ms={:.3f}/{:.3f} descriptors_ms={:.3f}/{:.3f} "
++                     "fences_ms={:.3f}/{:.3f} staging_ms={:.3f}/{:.3f} "
++                     "texture_cache_ms={:.3f}/{:.3f} buffer_cache_ms={:.3f}/{:.3f} (sum/max)",
++                     trace_tick_frames, trace_tick_sum_ms[0], trace_tick_max_ms[0],
++                     trace_tick_sum_ms[1], trace_tick_max_ms[1], trace_tick_sum_ms[2],
++                     trace_tick_max_ms[2], trace_tick_sum_ms[3], trace_tick_max_ms[3],
++                     trace_tick_sum_ms[4], trace_tick_max_ms[4], trace_tick_sum_ms[5],
++                     trace_tick_max_ms[5]);
++            trace_tick_sum_ms.fill(0.0);
++            trace_tick_max_ms.fill(0.0);
++            trace_tick_frames = 0;
++        }
++    }
+ }
+ 
+ bool RasterizerVulkan::AccelerateConditionalRendering() {
+diff --git a/src/video_core/renderer_vulkan/vk_rasterizer.h b/src/video_core/renderer_vulkan/vk_rasterizer.h
+index bb97cc4..b549a7c 100644
+--- a/src/video_core/renderer_vulkan/vk_rasterizer.h
++++ b/src/video_core/renderer_vulkan/vk_rasterizer.h
+@@ -382,6 +382,11 @@ private:
+     std::array<IndirectTrace, 8> indirect_traces;
+     Common::DkbFrameTrace::RateLimit trace_rate;
+     Common::DkbFrameTrace::RateLimit trace_cpu_rate;
++    // DKB tick trace: where TickFrame's time goes, summed and maxed per second (ms).
++    Common::DkbFrameTrace::RateLimit trace_tick_rate;
++    std::array<double, 6> trace_tick_sum_ms{};
++    std::array<double, 6> trace_tick_max_ms{};
++    u64 trace_tick_frames{};
+     std::optional<Common::DkbCpuTrace::Snapshot> trace_cpu_snapshot;
+     u64 trace_cpu_frame{};
+     bool trace_sample_frame{true};

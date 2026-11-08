@@ -1,0 +1,116 @@
+diff --git a/src/core/hle/service/nvdrv/core/syncpoint_manager.cpp b/src/core/hle/service/nvdrv/core/syncpoint_manager.cpp
+index c4c4c25..da5f9e9 100644
+--- a/src/core/hle/service/nvdrv/core/syncpoint_manager.cpp
++++ b/src/core/hle/service/nvdrv/core/syncpoint_manager.cpp
+@@ -2,12 +2,22 @@
+ // SPDX-FileCopyrightText: 2022 Skyline Team and Contributors
+ // SPDX-License-Identifier: GPL-3.0-or-later
+ 
++#include <cstdlib>
++
+ #include "common/assert.h"
+ #include "core/hle/service/nvdrv/core/syncpoint_manager.h"
+ #include "video_core/host1x/host1x.h"
+ 
+ namespace Service::Nvidia::NvCore {
+ 
++bool SyncpointManager::UsesGuestValues() {
++    static const bool guest = [] {
++        const char* value = std::getenv("EDEN_NX2_EVENT_GUEST");
++        return value != nullptr && value[0] != '0';
++    }();
++    return guest;
++}
++
+ SyncpointManager::SyncpointManager(Tegra::Host1x::Host1x& host1x_) : host1x{host1x_} {
+     constexpr u32 VBlank0SyncpointId{26};
+     constexpr u32 VBlank1SyncpointId{27};
+@@ -114,7 +124,9 @@ u32 SyncpointManager::UpdateMin(u32 id) {
+         return 0;
+     }
+ 
+-    syncpoint.counter_min = host1x.GetSyncpointManager().GetHostSyncpointValue(id);
++    const auto& host1x_syncpoints = host1x.GetSyncpointManager();
++    syncpoint.counter_min = UsesGuestValues() ? host1x_syncpoints.GetGuestSyncpointValue(id)
++                                              : host1x_syncpoints.GetHostSyncpointValue(id);
+     return syncpoint.counter_min;
+ }
+ 
+diff --git a/src/core/hle/service/nvdrv/core/syncpoint_manager.h b/src/core/hle/service/nvdrv/core/syncpoint_manager.h
+index 7728ff5..53866e2 100644
+--- a/src/core/hle/service/nvdrv/core/syncpoint_manager.h
++++ b/src/core/hle/service/nvdrv/core/syncpoint_manager.h
+@@ -79,6 +79,14 @@ public:
+      */
+     u32 UpdateMin(u32 id);
+ 
++    /**
++     * EDEN_NX2_EVENT_GUEST=1: nvhost event waits and UpdateMin follow the guest syncpoint (the
++     * emulator's GPU thread has processed the fence) instead of the host one (the host GPU has
++     * executed it). Removes the queue submission, the host GPU and the fencing thread from the
++     * wait, at the cost of readbacks the game does right after the wait seeing older data.
++     */
++    static bool UsesGuestValues();
++
+     /**
+      * @brief Frees the usage of a syncpoint.
+      */
+diff --git a/src/core/hle/service/nvdrv/devices/nvhost_ctrl.cpp b/src/core/hle/service/nvdrv/devices/nvhost_ctrl.cpp
+index 6ef32b8..eb5bd65 100644
+--- a/src/core/hle/service/nvdrv/devices/nvhost_ctrl.cpp
++++ b/src/core/hle/service/nvdrv/devices/nvhost_ctrl.cpp
+@@ -149,7 +149,11 @@ NvResult nvhost_ctrl::IocCtrlEventWait(IocCtrlEventWaitParams& params, bool is_a
+         if (events[slot].fails > 2) {
+             {
+                 auto lk = system.StallApplication();
+-                host1x_syncpoint_manager.WaitHost(fence_id, target_value);
++                if (NvCore::SyncpointManager::UsesGuestValues()) {
++                    host1x_syncpoint_manager.WaitGuest(fence_id, target_value);
++                } else {
++                    host1x_syncpoint_manager.WaitHost(fence_id, target_value);
++                }
+                 system.UnstallApplication();
+             }
+             params.value.raw = target_value;
+@@ -198,15 +202,20 @@ NvResult nvhost_ctrl::IocCtrlEventWait(IocCtrlEventWaitParams& params, bool is_a
+     }
+     params.value.raw |= slot;
+ 
++    const auto on_reached = [this, slot]() {
++        auto& event_ = events[slot];
++        if (event_.status.exchange(EventState::Signalling, std::memory_order_acq_rel) ==
++            EventState::Waiting) {
++            event_.kevent->Signal(system.Kernel());
++        }
++        event_.status.store(EventState::Signalled, std::memory_order_release);
++    };
++    // EDEN_NX2_EVENT_GUEST=1: wake on the guest syncpoint (GPU thread processed the fence; the
++    // same value the present's WaitForFrame trusts) instead of the host GPU's completion.
+     event.wait_handle =
+-        host1x_syncpoint_manager.RegisterHostAction(fence_id, target_value, [this, slot]() {
+-            auto& event_ = events[slot];
+-            if (event_.status.exchange(EventState::Signalling, std::memory_order_acq_rel) ==
+-                EventState::Waiting) {
+-                event_.kevent->Signal(system.Kernel());
+-            }
+-            event_.status.store(EventState::Signalled, std::memory_order_release);
+-        });
++        NvCore::SyncpointManager::UsesGuestValues()
++            ? host1x_syncpoint_manager.RegisterGuestAction(fence_id, target_value, on_reached)
++            : host1x_syncpoint_manager.RegisterHostAction(fence_id, target_value, on_reached);
+     return NvResult::Timeout;
+ }
+ 
+@@ -286,7 +295,11 @@ NvResult nvhost_ctrl::IocCtrlClearEventWait(IocCtrlEventClearParams& params) {
+     if (event.status.exchange(EventState::Cancelling, std::memory_order_acq_rel) ==
+         EventState::Waiting) {
+         auto& host1x_syncpoint_manager = system.Host1x().GetSyncpointManager();
+-        host1x_syncpoint_manager.DeregisterHostAction(event.assigned_syncpt, event.wait_handle);
++        if (NvCore::SyncpointManager::UsesGuestValues()) {
++            host1x_syncpoint_manager.DeregisterGuestAction(event.assigned_syncpt, event.wait_handle);
++        } else {
++            host1x_syncpoint_manager.DeregisterHostAction(event.assigned_syncpt, event.wait_handle);
++        }
+         syncpoint_manager.UpdateMin(event.assigned_syncpt);
+         event.wait_handle = {};
+     }
