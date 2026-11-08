@@ -214,6 +214,18 @@ Com `EDEN_MAC_MESH_BATCH=1`, os dispatches da emulação de mesh rodam num lote 
 
 A imagem saiu igual. O ganho estimado de ~2 ms fica abaixo do ruído enquanto a rede de anti-aliasing ocupa ~53 ms do quadro. O patch fica para quando a rede deixar de dominar. Ficou de fora: teste unitário do lote, porque o build não tem `YUZU_TESTS`.
 
+### Marco 3: a rede nativa sem cópias dobra o fps de fábrica
+
+| Mac, Kokiri, imagem de fábrica | fps | Tempo de quadro | GPU |
+|---|---|---|---|
+| Sem correções (FAC0) | 4,9 | ~200 ms | 96% |
+| `FAST_FP` (FAC-FFP) | 9,6 | 104 ms | 92% |
+| `FAST_FP` + `EDEN_MAC_NATIVE_NET` com HMMA `noinline` (NET-NOINL) | **17,2** | 60 ms | 86% |
+
+Com o MoltenVK que já vem no `.app`, os 10 programas com HMMA usados na cena foram trocados pelo MSL próprio. O log confirma cada troca pelo hash, sem erro do MoltenVK e sem falha de pipeline. A matemática é a mesma por construção: o MSL é idêntico ao que o MoltenVK gera, só com o HMMA marcado `noinline`. O print sai igual ao do FAC-FFP; só a pose do Link e a posição da fada mudam.
+
+Da imagem de fábrica sem correções até aqui, o ganho foi de 3,5 vezes.
+
 ### Onde paramos no Mac
 
 | Mac, Kokiri | Sem correção | `EDEN_MAC_FAST_FP=1` |
