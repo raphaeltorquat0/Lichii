@@ -74,6 +74,21 @@ O menu roda 6 vezes mais rápido que no Deck. No jogo o Mac fica abaixo do Deck.
 
 40 a 50 fps no jogo, com a imagem de fábrica. A conta permite: a GPU do M2 Pro deveria fazer a cena em 15 a 20 ms, e os núcleos de CPU são ~2 vezes mais rápidos que os do Deck. Falta tirar o caminho Vulkan → MoltenVK → Metal da ineficiência de ~12 vezes e a CPU do caminho lento.
 
+### O que os contadores da GPU mostraram
+
+Um novo Metal System Trace, agora com o bypass do anti-aliasing ligado, contou outra história.
+
+- **O compute de 58 ms era mesmo a rede de anti-aliasing.** Com o bypass ele sumiu do trace. O quadro continuou em ~180 ms porque a rede não era o único problema.
+- **A GPU parece cheia, mas fica ociosa por dentro.** Por quadro há ~310 encoders de render (~120 ms de fragment) e ~500 de compute. Os contadores mostram ocupação de fragment em ~10% e ALU em ~7%. O compilador do Metal registra spill de registradores em quase todo encoder.
+- **Causa provável na tradução de shaders.** O yuzu decora toda multiplicação e soma de ponto flutuante com `NoContraction`, para impedir FMA e manter o resultado exato. O SPIRV-Cross traduz cada uma dessas operações para uma função `spvFMul`/`spvFAdd` marcada `[[clang::optnone]]`, que o compilador do Metal não consegue inlinar. No dump de shaders são 6.284 chamadas a `spvFMul` em 24 shaders.
+- **Um compute extra depois de cada render pass.** O MoltenVK acumula o resultado das occlusion queries com um compute depois de cada render pass, ~300 vezes por quadro, porque o contador ZPass do Ocarina fica sempre ligado.
+- **Não há NCE no macOS.** O código nativo do guest só existe para Android e Linux (`CMakeLists.txt:324`). No Mac o guest roda no Dynarmic.
+
+Duas correções implementadas, cada uma atrás de uma chave:
+
+- `EDEN_MAC_FAST_FP=1`: tira o `NoContraction` no caminho do MoltenVK, para os shaders voltarem a ser código inlinável.
+- `EDEN_MAC_NO_OCCLUSION=<n>`: reduz o acúmulo de occlusion queries depois de cada render pass.
+
 ### Próximos passos
 
 _Em andamento: identificar o shader de 58 ms e o limitador dele nos contadores da GPU, explicar os 195 render passes e corrigir, com cada mudança atrás de uma chave `EDEN_MAC_*` e medida no save._
