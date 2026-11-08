@@ -1,0 +1,542 @@
+diff --git a/src/video_core/renderer_vulkan/vk_master_semaphore.cpp b/src/video_core/renderer_vulkan/vk_master_semaphore.cpp
+index ba364d9..18e74a8 100644
+--- a/src/video_core/renderer_vulkan/vk_master_semaphore.cpp
++++ b/src/video_core/renderer_vulkan/vk_master_semaphore.cpp
+@@ -118,11 +118,13 @@ void MasterSemaphore::Wait(u64 tick) {
+ 
+ VkResult MasterSemaphore::SubmitQueue(vk::CommandBuffer& cmdbuf, vk::CommandBuffer& upload_cmdbuf,
+                                       VkSemaphore signal_semaphore, VkSemaphore wait_semaphore,
+-                                      u64 host_tick) {
++                                      u64 host_tick, VkSemaphore extra_wait_semaphore,
++                                      u64 extra_wait_value) {
+     if (semaphore) {
+         return SubmitQueueTimeline(cmdbuf, upload_cmdbuf, signal_semaphore, wait_semaphore,
+-                                   host_tick);
++                                   host_tick, extra_wait_semaphore, extra_wait_value);
+     } else {
++        // No timeline semaphores: the scheduler makes no dependency lane, so nothing passes one.
+         return SubmitQueueFence(cmdbuf, upload_cmdbuf, signal_semaphore, wait_semaphore, host_tick);
+     }
+ }
+@@ -133,7 +135,9 @@ static constexpr VkPipelineStageFlags wait_stage_mask = VK_PIPELINE_STAGE_VERTEX
+ VkResult MasterSemaphore::SubmitQueueTimeline(vk::CommandBuffer& cmdbuf,
+                                               vk::CommandBuffer& upload_cmdbuf,
+                                               VkSemaphore signal_semaphore,
+-                                              VkSemaphore wait_semaphore, u64 host_tick) {
++                                              VkSemaphore wait_semaphore, u64 host_tick,
++                                              VkSemaphore extra_wait_semaphore,
++                                              u64 extra_wait_value) {
+     const VkSemaphore timeline_semaphore = *semaphore;
+ 
+     if (device.HasSynchronization2()) {
+@@ -176,22 +180,35 @@ VkResult MasterSemaphore::SubmitQueueTimeline(vk::CommandBuffer& cmdbuf,
+             num_signal_semaphores = 2;
+         }
+ 
+-        const u32 num_wait_semaphores = wait_semaphore ? 1 : 0;
+-        const VkSemaphoreSubmitInfo wait_info{
+-            .sType = VK_STRUCTURE_TYPE_SEMAPHORE_SUBMIT_INFO,
+-            .pNext = nullptr,
+-            .semaphore = wait_semaphore,
+-            .value = 0,
+-            .stageMask = static_cast<VkPipelineStageFlags2>(wait_stage_mask),
+-            .deviceIndex = 0,
+-        };
++        std::array<VkSemaphoreSubmitInfo, 2> wait_infos{};
++        u32 num_wait_semaphores = 0;
++        if (wait_semaphore) {
++            wait_infos[num_wait_semaphores++] = VkSemaphoreSubmitInfo{
++                .sType = VK_STRUCTURE_TYPE_SEMAPHORE_SUBMIT_INFO,
++                .pNext = nullptr,
++                .semaphore = wait_semaphore,
++                .value = 0,
++                .stageMask = static_cast<VkPipelineStageFlags2>(wait_stage_mask),
++                .deviceIndex = 0,
++            };
++        }
++        if (extra_wait_semaphore) {
++            wait_infos[num_wait_semaphores++] = VkSemaphoreSubmitInfo{
++                .sType = VK_STRUCTURE_TYPE_SEMAPHORE_SUBMIT_INFO,
++                .pNext = nullptr,
++                .semaphore = extra_wait_semaphore,
++                .value = extra_wait_value,
++                .stageMask = VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT,
++                .deviceIndex = 0,
++            };
++        }
+ 
+         const VkSubmitInfo2 submit_info2{
+             .sType = VK_STRUCTURE_TYPE_SUBMIT_INFO_2,
+             .pNext = nullptr,
+             .flags = 0,
+             .waitSemaphoreInfoCount = num_wait_semaphores,
+-            .pWaitSemaphoreInfos = num_wait_semaphores ? &wait_info : nullptr,
++            .pWaitSemaphoreInfos = num_wait_semaphores ? wait_infos.data() : nullptr,
+             .commandBufferInfoCount = static_cast<u32>(cmdbuffer_infos.size()),
+             .pCommandBufferInfos = cmdbuffer_infos.data(),
+             .signalSemaphoreInfoCount = num_signal_semaphores,
+@@ -206,20 +223,33 @@ VkResult MasterSemaphore::SubmitQueueTimeline(vk::CommandBuffer& cmdbuf,
+ 
+     const std::array cmdbuffers{*upload_cmdbuf, *cmdbuf};
+ 
+-    const u32 num_wait_semaphores = wait_semaphore ? 1 : 0;
++    std::array<VkSemaphore, 2> wait_semaphores{};
++    std::array<VkPipelineStageFlags, 2> wait_masks{};
++    std::array<u64, 2> wait_values{}; // 0 for the binary semaphore
++    u32 num_wait_semaphores = 0;
++    if (wait_semaphore) {
++        wait_semaphores[num_wait_semaphores] = wait_semaphore;
++        wait_masks[num_wait_semaphores] = wait_stage_mask;
++        ++num_wait_semaphores;
++    }
++    if (extra_wait_semaphore) {
++        wait_semaphores[num_wait_semaphores] = extra_wait_semaphore;
++        wait_masks[num_wait_semaphores] = VK_PIPELINE_STAGE_ALL_COMMANDS_BIT;
++        wait_values[num_wait_semaphores] = extra_wait_value;
++        ++num_wait_semaphores;
++    }
+     // Pointers must be null when the count is zero (best-practices)
+     const VkSemaphore* p_wait_sems =
+-        (num_wait_semaphores > 0) ? &wait_semaphore : nullptr;
++        (num_wait_semaphores > 0) ? wait_semaphores.data() : nullptr;
+     const VkPipelineStageFlags* p_wait_masks =
+-        (num_wait_semaphores > 0) ? &wait_stage_mask : nullptr;
++        (num_wait_semaphores > 0) ? wait_masks.data() : nullptr;
+     const VkSemaphore* p_signal_sems =
+         (num_signal_semaphores > 0) ? signal_semaphores.data() : nullptr;
+-    const u64 wait_zero = 0; // dummy for binary wait
+     const VkTimelineSemaphoreSubmitInfo timeline_si{
+         .sType = VK_STRUCTURE_TYPE_TIMELINE_SEMAPHORE_SUBMIT_INFO,
+         .pNext = nullptr,
+         .waitSemaphoreValueCount = num_wait_semaphores,
+-        .pWaitSemaphoreValues    = num_wait_semaphores ? &wait_zero : nullptr,
++        .pWaitSemaphoreValues    = num_wait_semaphores ? wait_values.data() : nullptr,
+         .signalSemaphoreValueCount = num_signal_semaphores,
+         .pSignalSemaphoreValues = signal_values.data(),
+     };
+diff --git a/src/video_core/renderer_vulkan/vk_master_semaphore.h b/src/video_core/renderer_vulkan/vk_master_semaphore.h
+index f580c25..064c893 100644
+--- a/src/video_core/renderer_vulkan/vk_master_semaphore.h
++++ b/src/video_core/renderer_vulkan/vk_master_semaphore.h
+@@ -54,14 +54,24 @@ public:
+     /// Waits for a tick to be hit on the GPU
+     void Wait(u64 tick);
+ 
+-    /// Submits the device graphics queue, updating the tick as necessary
++    /// Submits the device graphics queue, updating the tick as necessary. `extra_wait_semaphore`
++    /// is a timeline semaphore the submission first waits to reach `extra_wait_value` (the
++    /// scheduler's dependency lane, EDEN_NX2_ASYNC_DEP_QUEUE); null = none. Timeline path only.
+     VkResult SubmitQueue(vk::CommandBuffer& cmdbuf, vk::CommandBuffer& upload_cmdbuf,
+-                         VkSemaphore signal_semaphore, VkSemaphore wait_semaphore, u64 host_tick);
++                         VkSemaphore signal_semaphore, VkSemaphore wait_semaphore, u64 host_tick,
++                         VkSemaphore extra_wait_semaphore = VK_NULL_HANDLE,
++                         u64 extra_wait_value = 0);
++
++    /// The timeline semaphore (null without timeline semaphores): other queues wait on it.
++    [[nodiscard]] VkSemaphore Handle() const noexcept {
++        return *semaphore;
++    }
+ 
+ private:
+     VkResult SubmitQueueTimeline(vk::CommandBuffer& cmdbuf, vk::CommandBuffer& upload_cmdbuf,
+                                  VkSemaphore signal_semaphore, VkSemaphore wait_semaphore,
+-                                 u64 host_tick);
++                                 u64 host_tick, VkSemaphore extra_wait_semaphore,
++                                 u64 extra_wait_value);
+     VkResult SubmitQueueFence(vk::CommandBuffer& cmdbuf, vk::CommandBuffer& upload_cmdbuf,
+                               VkSemaphore signal_semaphore, VkSemaphore wait_semaphore,
+                               u64 host_tick);
+diff --git a/src/video_core/renderer_vulkan/vk_scheduler.cpp b/src/video_core/renderer_vulkan/vk_scheduler.cpp
+index 19bbcd9..5367785 100644
+--- a/src/video_core/renderer_vulkan/vk_scheduler.cpp
++++ b/src/video_core/renderer_vulkan/vk_scheduler.cpp
+@@ -26,6 +26,7 @@
+ #include "common/thread.h"
+ #include "video_core/gpu_logging/gpu_logging.h"
+ #include "video_core/nx2_profile.h"
++#include "common/assert.h"
+ #include "video_core/renderer_vulkan/vk_command_pool.h"
+ #include "video_core/renderer_vulkan/vk_graphics_pipeline.h"
+ #include "video_core/renderer_vulkan/vk_master_semaphore.h"
+@@ -112,6 +113,31 @@ Scheduler::Scheduler(const Device& device_, StateTracker& state_tracker_)
+     : device{device_}, state_tracker{state_tracker_},
+       master_semaphore{std::make_unique<MasterSemaphore>(device)},
+       command_pool{std::make_unique<CommandPool>(*master_semaphore, device)} {
++    if (device.HasDependencyQueue() && device.HasTimelineSemaphore()) {
++        dependency_lane = std::make_unique<DependencyLane>();
++        dependency_lane->pool = device.GetLogical().CreateCommandPool({
++            .sType = VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO,
++            .pNext = nullptr,
++            .flags = VK_COMMAND_POOL_CREATE_TRANSIENT_BIT |
++                     VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT,
++            .queueFamilyIndex = device.GetDependencyFamily(),
++        });
++        dependency_lane->cmdbufs = dependency_lane->pool.Allocate(DependencyLane::NumBuffers);
++        static constexpr VkSemaphoreTypeCreateInfo lane_semaphore_type_ci{
++            .sType = VK_STRUCTURE_TYPE_SEMAPHORE_TYPE_CREATE_INFO,
++            .pNext = nullptr,
++            .semaphoreType = VK_SEMAPHORE_TYPE_TIMELINE,
++            .initialValue = 0,
++        };
++        static constexpr VkSemaphoreCreateInfo lane_semaphore_ci{
++            .sType = VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO,
++            .pNext = &lane_semaphore_type_ci,
++            .flags = 0,
++        };
++        dependency_lane->semaphore = device.GetLogical().CreateSemaphore(lane_semaphore_ci);
++        LOG_INFO(Render_Vulkan, "Dependency lane: {} command buffers on queue family {}",
++                 DependencyLane::NumBuffers, device.GetDependencyFamily());
++    }
+ 
+     if (Common::DkbFrameTrace::Enabled()) {
+         const auto physical = device.GetPhysical();
+@@ -161,6 +187,139 @@ Scheduler::~Scheduler() {
+             master_semaphore->Wait(trace_gpu_tick);
+         }
+     }
++    // The lane's pool and semaphore go with this object: let the queue finish them first.
++    if (dependency_lane && dependency_lane->tick != 0) {
++        dependency_lane->semaphore.Wait(dependency_lane->tick);
++    }
++}
++
++vk::CommandBuffer Scheduler::BeginDependencyCommands() {
++    DependencyLane& lane = *dependency_lane;
++    ASSERT_MSG(!lane.recording, "Dependency command buffer already open");
++    const size_t index = lane.next_buffer;
++    lane.next_buffer = (index + 1) % DependencyLane::NumBuffers;
++    // vkBeginCommandBuffer resets the buffer (RESET_COMMAND_BUFFER_BIT pool): its previous
++    // submission must be complete.
++    if (lane.ticks[index] != 0) {
++        WaitDependency(lane.ticks[index]);
++    }
++    lane.current = vk::CommandBuffer(lane.cmdbufs[index], device.GetDispatchLoader());
++    lane.current.Begin({
++        .sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO,
++        .pNext = nullptr,
++        .flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT,
++        .pInheritanceInfo = nullptr,
++    });
++    lane.ticks[index] = lane.tick + 1; // what SubmitDependencyCommands signals for it
++    lane.recording = true;
++    return lane.current;
++}
++
++u64 Scheduler::SubmitDependencyCommands(u64 wait_main_tick) {
++    DependencyLane& lane = *dependency_lane;
++    ASSERT_MSG(lane.recording, "No dependency command buffer open");
++    // A wait on an unsubmitted main tick could wait on a main submission that itself waits for
++    // this lane (MainWaitsForDependency): the caller flushes first.
++    ASSERT_MSG(wait_main_tick == 0 || IsSubmitted(wait_main_tick),
++               "Dependency lane waits for unsubmitted main tick {}", wait_main_tick);
++    lane.current.End();
++    lane.recording = false;
++    const u64 signal_value = ++lane.tick;
++    const VkSemaphore main_semaphore = master_semaphore->Handle();
++    const VkSemaphore lane_semaphore = *lane.semaphore;
++    const bool wait_main = wait_main_tick != 0 && main_semaphore != VK_NULL_HANDLE;
++    const VkCommandBuffer cmdbuf = *lane.current;
++    // Another queue than the worker's: the two submit concurrently without a lock.
++    VkResult result{};
++    if (device.HasSynchronization2()) {
++        const VkCommandBufferSubmitInfo cmdbuf_info{
++            .sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_SUBMIT_INFO,
++            .pNext = nullptr,
++            .commandBuffer = cmdbuf,
++            .deviceMask = 0,
++        };
++        const VkSemaphoreSubmitInfo wait_info{
++            .sType = VK_STRUCTURE_TYPE_SEMAPHORE_SUBMIT_INFO,
++            .pNext = nullptr,
++            .semaphore = main_semaphore,
++            .value = wait_main_tick,
++            .stageMask = VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT,
++            .deviceIndex = 0,
++        };
++        const VkSemaphoreSubmitInfo signal_info{
++            .sType = VK_STRUCTURE_TYPE_SEMAPHORE_SUBMIT_INFO,
++            .pNext = nullptr,
++            .semaphore = lane_semaphore,
++            .value = signal_value,
++            .stageMask = VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT,
++            .deviceIndex = 0,
++        };
++        const VkSubmitInfo2 submit_info{
++            .sType = VK_STRUCTURE_TYPE_SUBMIT_INFO_2,
++            .pNext = nullptr,
++            .flags = 0,
++            .waitSemaphoreInfoCount = wait_main ? 1U : 0U,
++            .pWaitSemaphoreInfos = wait_main ? &wait_info : nullptr,
++            .commandBufferInfoCount = 1,
++            .pCommandBufferInfos = &cmdbuf_info,
++            .signalSemaphoreInfoCount = 1,
++            .pSignalSemaphoreInfos = &signal_info,
++        };
++        result = device.GetDependencyQueue().Submit2(submit_info);
++    } else {
++        const VkPipelineStageFlags wait_stage = VK_PIPELINE_STAGE_ALL_COMMANDS_BIT;
++        const VkTimelineSemaphoreSubmitInfo timeline_info{
++            .sType = VK_STRUCTURE_TYPE_TIMELINE_SEMAPHORE_SUBMIT_INFO,
++            .pNext = nullptr,
++            .waitSemaphoreValueCount = wait_main ? 1U : 0U,
++            .pWaitSemaphoreValues = wait_main ? &wait_main_tick : nullptr,
++            .signalSemaphoreValueCount = 1,
++            .pSignalSemaphoreValues = &signal_value,
++        };
++        const VkSubmitInfo submit_info{
++            .sType = VK_STRUCTURE_TYPE_SUBMIT_INFO,
++            .pNext = &timeline_info,
++            .waitSemaphoreCount = wait_main ? 1U : 0U,
++            .pWaitSemaphores = wait_main ? &main_semaphore : nullptr,
++            .pWaitDstStageMask = wait_main ? &wait_stage : nullptr,
++            .commandBufferCount = 1,
++            .pCommandBuffers = &cmdbuf,
++            .signalSemaphoreCount = 1,
++            .pSignalSemaphores = &lane_semaphore,
++        };
++        result = device.GetDependencyQueue().Submit(submit_info);
++    }
++    if (result == VK_ERROR_DEVICE_LOST) {
++        device.ReportLoss();
++    }
++    vk::Check(result);
++    return signal_value;
++}
++
++void Scheduler::MainWaitsForDependency(u64 lane_tick) {
++    DependencyLane& lane = *dependency_lane;
++    lane.pending_main_wait = (std::max)(lane.pending_main_wait, lane_tick);
++}
++
++bool Scheduler::IsDependencyFree(u64 lane_tick) {
++    DependencyLane& lane = *dependency_lane;
++    if (lane.known_gpu_tick.load(std::memory_order_acquire) >= lane_tick) {
++        return true;
++    }
++    const u64 value = lane.semaphore.GetCounter();
++    lane.known_gpu_tick.store(value, std::memory_order_release);
++    return value >= lane_tick;
++}
++
++void Scheduler::WaitDependency(u64 lane_tick) {
++    if (IsDependencyFree(lane_tick)) {
++        return;
++    }
++    DependencyLane& lane = *dependency_lane;
++    lane.semaphore.Wait(lane_tick);
++    lane.known_gpu_tick.store(
++        (std::max)(lane.known_gpu_tick.load(std::memory_order_relaxed), lane_tick),
++        std::memory_order_release);
+ }
+ 
+ u64 Scheduler::Flush(VkSemaphore signal_semaphore, VkSemaphore wait_semaphore,
+@@ -783,7 +942,13 @@ u64 Scheduler::SubmitExecution(VkSemaphore signal_semaphore, VkSemaphore wait_se
+     InvalidateState();
+ 
+     const u64 signal_value = master_semaphore->NextTick();
+-    RecordWithUploadBuffer([signal_semaphore, wait_semaphore, signal_value,
++    // The dependency lane's outputs this submission consumes (MainWaitsForDependency), if any.
++    const u64 dep_wait_value =
++        dependency_lane ? std::exchange(dependency_lane->pending_main_wait, u64{0}) : 0;
++    const VkSemaphore dep_wait_semaphore =
++        dep_wait_value != 0 ? *dependency_lane->semaphore : VK_NULL_HANDLE;
++    RecordWithUploadBuffer([signal_semaphore, wait_semaphore, signal_value, dep_wait_semaphore,
++                            dep_wait_value,
+                             this](vk::CommandBuffer cmdbuf, vk::CommandBuffer upload_cmdbuf) {
+         static constexpr VkMemoryBarrier WRITE_BARRIER{
+             .sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER,
+@@ -815,7 +980,8 @@ u64 Scheduler::SubmitExecution(VkSemaphore signal_semaphore, VkSemaphore wait_se
+ 
+         std::scoped_lock lock{submit_mutex};
+         switch (const VkResult result = master_semaphore->SubmitQueue(
+-                    cmdbuf, upload_cmdbuf, signal_semaphore, wait_semaphore, signal_value)) {
++                    cmdbuf, upload_cmdbuf, signal_semaphore, wait_semaphore, signal_value,
++                    dep_wait_semaphore, dep_wait_value)) {
+         case VK_SUCCESS:
+             // Log successful queue submission
+             if (GPU::Logging::IsActive() &&
+diff --git a/src/video_core/renderer_vulkan/vk_scheduler.h b/src/video_core/renderer_vulkan/vk_scheduler.h
+index f977051..02f6da5 100644
+--- a/src/video_core/renderer_vulkan/vk_scheduler.h
++++ b/src/video_core/renderer_vulkan/vk_scheduler.h
+@@ -7,6 +7,7 @@
+ #pragma once
+ 
+ #include <array>
++#include <atomic>
+ #include <chrono>
+ #include <condition_variable>
+ #include <cstddef>
+@@ -308,6 +309,27 @@ public:
+         return *master_semaphore;
+     }
+ 
++    /// EDEN_NX2_ASYNC_DEP_QUEUE (vulkan_device.h HasDependencyQueue, timeline semaphores): a
++    /// second command stream on the device's dependency queue for the compute work whose results
++    /// the CPU or the command list parser waits for. Recorded and submitted by the recording
++    /// thread (the split's back) with its own command pool and timeline; its ticks are
++    /// independent of the main stream's. Absent when the switch is off or the device lacks it.
++    [[nodiscard]] bool HasDependencyLane() const noexcept {
++        return dependency_lane != nullptr;
++    }
++    /// Begins the dependency command buffer of the next submission (one per submission) and
++    /// returns it: commands are recorded straight into it, on this thread, until the submit.
++    vk::CommandBuffer BeginDependencyCommands();
++    /// Ends and submits it. The queue first waits for the main timeline to reach `wait_main_tick`
++    /// (0: no wait; it must be a submitted tick, IsSubmitted, or the two queues can wait on each
++    /// other), then signals the lane's timeline with the returned lane tick.
++    u64 SubmitDependencyCommands(u64 wait_main_tick);
++    /// The next main submission waits for the lane's timeline to reach `lane_tick` before any of
++    /// its commands: what consumes the lane's outputs is recorded after this call.
++    void MainWaitsForDependency(u64 lane_tick);
++    [[nodiscard]] bool IsDependencyFree(u64 lane_tick);
++    void WaitDependency(u64 lane_tick);
++
+     std::mutex submit_mutex;
+ 
+ private:
+@@ -452,6 +474,21 @@ private:
+     bool graphics_pipeline_missing{};
+     std::unique_ptr<CommandPool> command_pool;
+ 
++    struct DependencyLane {
++        static constexpr size_t NumBuffers = 64;
++        vk::CommandPool pool;
++        vk::CommandBuffers cmdbufs;
++        std::array<u64, NumBuffers> ticks{}; ///< Lane tick each buffer was last submitted with
++        vk::Semaphore semaphore;             ///< Timeline: its value is the lane tick completed
++        u64 tick{};                          ///< Last lane tick submitted (recording thread)
++        std::atomic<u64> known_gpu_tick{};
++        size_t next_buffer{};
++        vk::CommandBuffer current;
++        bool recording{};
++        u64 pending_main_wait{}; ///< MainWaitsForDependency, taken by the next SubmitExecution
++    };
++    std::unique_ptr<DependencyLane> dependency_lane;
++
+     vk::QueryPool trace_query_pool;
+     static constexpr u32 TraceMaxSubmissions = 512;
+     struct SubmissionTrace {
+diff --git a/src/video_core/vulkan_common/vulkan_device.cpp b/src/video_core/vulkan_common/vulkan_device.cpp
+index d2cb708..0816d5d 100644
+--- a/src/video_core/vulkan_common/vulkan_device.cpp
++++ b/src/video_core/vulkan_common/vulkan_device.cpp
+@@ -784,6 +784,11 @@ Device::Device(VkInstance instance_, vk::PhysicalDevice physical_, VkSurfaceKHR
+ 
+     graphics_queue = logical.GetQueue(graphics_family);
+     present_queue = logical.GetQueue(present_family);
++    if (has_dependency_queue) {
++        VkQueue queue{};
++        dld.vkGetDeviceQueue(*logical, dependency_family, dependency_queue_index, &queue);
++        dependency_queue = vk::Queue(queue, dld);
++    }
+ 
+ #ifdef EGLANTINE_STREAMLINE
+     if (streamline_extensions) {
+@@ -1875,6 +1880,38 @@ void Device::SetupFamilies(VkSurfaceKHR surface) {
+     if (present) {
+         present_family = *present;
+     }
++    // EDEN_NX2_ASYNC_DEP_QUEUE: a queue the dependency-producing compute can run on, ahead of the
++    // graphics queue's backlog (vk_scheduler.h DependencyLane). Read with getenv here: the device
++    // is made before the GPU, and video_core/nx2.h is not a dependency of this file.
++    const char* const dep_queue = std::getenv("EDEN_NX2_ASYNC_DEP_QUEUE");
++    if (dep_queue != nullptr && dep_queue[0] == '1') {
++        for (u32 index = 0; index < static_cast<u32>(queue_family_properties.size()); ++index) {
++            const VkQueueFamilyProperties& queue_family = queue_family_properties[index];
++            if (queue_family.queueCount != 0 &&
++                (queue_family.queueFlags & VK_QUEUE_COMPUTE_BIT) != 0 &&
++                (queue_family.queueFlags & VK_QUEUE_GRAPHICS_BIT) == 0) {
++                dependency_family = index;
++                dependency_queue_index = 0;
++                has_dependency_queue = true;
++                break;
++            }
++        }
++        if (!has_dependency_queue && queue_family_properties[graphics_family].queueCount >= 2) {
++            dependency_family = graphics_family;
++            dependency_queue_index = 1;
++            has_dependency_queue = true;
++        }
++        if (has_dependency_queue) {
++            LOG_INFO(Render_Vulkan, "Dependency queue: family {} queue {} ({})", dependency_family,
++                     dependency_queue_index,
++                     dependency_family == graphics_family ? "second graphics queue"
++                                                          : "compute-only family");
++        } else {
++            LOG_WARNING(Render_Vulkan,
++                        "EDEN_NX2_ASYNC_DEP_QUEUE: no compute-only queue family and a single "
++                        "graphics queue; the dependency queue stays off");
++        }
++    }
+ }
+ 
+ bool Device::TryReserveCustomBorderColorSamplers(size_t count) const {
+@@ -2044,22 +2081,28 @@ void Device::CollectToolingInfo() {
+ }
+ 
+ std::vector<VkDeviceQueueCreateInfo> Device::GetDeviceQueueCreateInfos() const {
+-    static constexpr float QUEUE_PRIORITY = 1.0f;
++    // Two entries: the graphics family asks for two queues when it also gives the dependency queue.
++    static constexpr std::array<float, 2> QUEUE_PRIORITIES{1.0f, 1.0f};
+ 
+     ::Common::unordered_set<u32> unique_queue_families{graphics_family, present_family};
++    if (has_dependency_queue) {
++        unique_queue_families.insert(dependency_family);
++    }
+     std::vector<VkDeviceQueueCreateInfo> queue_cis;
+     queue_cis.reserve(unique_queue_families.size());
+ 
+     for (const u32 queue_family : unique_queue_families) {
++        const bool two_queues = has_dependency_queue && queue_family == dependency_family &&
++                                dependency_queue_index == 1;
+         auto& ci = queue_cis.emplace_back(VkDeviceQueueCreateInfo{
+             .sType = VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO,
+             .pNext = nullptr,
+             .flags = 0,
+             .queueFamilyIndex = queue_family,
+-            .queueCount = 1,
++            .queueCount = two_queues ? 2U : 1U,
+             .pQueuePriorities = nullptr,
+         });
+-        ci.pQueuePriorities = &QUEUE_PRIORITY;
++        ci.pQueuePriorities = QUEUE_PRIORITIES.data();
+     }
+ 
+     return queue_cis;
+diff --git a/src/video_core/vulkan_common/vulkan_device.h b/src/video_core/vulkan_common/vulkan_device.h
+index a940e4d..f1e2b7d 100644
+--- a/src/video_core/vulkan_common/vulkan_device.h
++++ b/src/video_core/vulkan_common/vulkan_device.h
+@@ -324,6 +324,20 @@ public:
+         return present_family;
+     }
+ 
++    /// EDEN_NX2_ASYNC_DEP_QUEUE (video_core/nx2.h): a second queue for the dependency-producing
++    /// compute work: a compute-only family's first queue when the device has one, else a second
++    /// queue of the graphics family. False with the switch off, or with neither available (the
++    /// switch is then inert).
++    bool HasDependencyQueue() const {
++        return has_dependency_queue;
++    }
++    vk::Queue GetDependencyQueue() const {
++        return dependency_queue;
++    }
++    u32 GetDependencyFamily() const {
++        return dependency_family;
++    }
++
+     /// Returns the current Vulkan API version provided in Vulkan-formatted version numbers.
+     u32 ApiVersion() const {
+         return properties.properties.apiVersion;
+@@ -1283,6 +1297,10 @@ private:
+     u32 graphics_family{};       ///< Main graphics queue family index.
+     u32 present_family{};        ///< Main present queue family index.
+     bool graphics_family_sparse_binding{};
++    vk::Queue dependency_queue;  ///< EDEN_NX2_ASYNC_DEP_QUEUE second queue (HasDependencyQueue).
++    u32 dependency_family{};
++    u32 dependency_queue_index{};
++    bool has_dependency_queue{};
+ 
+     struct Extensions {
+ #define EXTENSION(prefix, macro_name, var_name) bool var_name{};

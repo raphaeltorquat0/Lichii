@@ -1,0 +1,122 @@
+diff --git a/dist/nx2_switches.txt b/dist/nx2_switches.txt
+index 7926f15..4c4ea23 100644
+--- a/dist/nx2_switches.txt
++++ b/dist/nx2_switches.txt
+@@ -46,6 +46,13 @@ EDEN_NX2_FENCE_BATCH=1
+ # data; the first read of each page still takes the generic path.
+ #EDEN_NX2_READ_COPY=1
+ 
++# Dependency queue (experimental, Switch 2 titles): compute dispatches and DMA copies whose output
++# the CPU reads or that write GPU-written command lists are counted per frame (log every 600
++# frames), the device opens a second queue (compute-only family, else a second graphics queue)
++# and the scheduler a second command stream for them. Later stages route them there so the
++# CPU-side waits no longer drain the whole graphics queue. Off: nothing changes.
++#EDEN_NX2_ASYNC_DEP_QUEUE=1
++
+ # Semaphore acquires read the word without draining the split's back first (the back's own
+ # releases still latch the waiter). Lets the front run ahead of the back while a channel waits
+ # on a CPU-released semaphore (Ocarina of Time, most of every frame).
+diff --git a/src/video_core/buffer_cache/buffer_cache.h b/src/video_core/buffer_cache/buffer_cache.h
+index 4d21e10..29e429d 100644
+--- a/src/video_core/buffer_cache/buffer_cache.h
++++ b/src/video_core/buffer_cache/buffer_cache.h
+@@ -324,8 +324,10 @@ std::optional<VideoCore::RasterizerDownloadArea> BufferCache<P>::GetFlushArea(DA
+             // really rearms the core instead of being skipped by the deduplication cache.
+             read_trapped_ranges.Subtract(
+                 device_addr_start_aligned, device_addr_end_aligned - device_addr_start_aligned);
+-            // The next writer copies these pages to host memory (Nx2DownloadFromListCopies).
+-            if (Nx2ReadCopyEnabled() && Tegra::g_nx2_ampere.load(std::memory_order_relaxed)) {
++            // The next writer copies these pages to host memory (Nx2DownloadFromListCopies);
++            // with the dependency queue it is also a dependency producer (nx2.h).
++            if ((Nx2ReadCopyEnabled() || Tegra::Nx2DepQueueEnabled()) &&
++                Tegra::g_nx2_ampere.load(std::memory_order_relaxed)) {
+                 for (DAddr page = device_addr_start_aligned; page < device_addr_end_aligned;
+                      page += DAddr{1} << Tegra::Nx2WrittenPageBits) {
+                     Tegra::Nx2MarkCommandListPage(page);
+diff --git a/src/video_core/nx2.h b/src/video_core/nx2.h
+index e85e614..fbec059 100644
+--- a/src/video_core/nx2.h
++++ b/src/video_core/nx2.h
+@@ -6,6 +6,7 @@
+ #include <algorithm>
+ #include <array>
+ #include <atomic>
++#include <cstdlib>
+ #include <functional>
+ #include <map>
+ #include <mutex>
+@@ -84,6 +85,26 @@ inline void Nx2MarkCommandListPage(u64 device_address) {
+     return (g_nx2_command_list_pages[page / 64].load(std::memory_order_relaxed) >> (page % 64)) & 1;
+ }
+ 
++// EDEN_NX2_ASYNC_DEP_QUEUE=1: "dependency producers" are the compute dispatches and DMA copies
++// whose output the CPU reads (GetFlushArea marks those pages like command list pages) or that
++// write GPU-written command list pages: a guest thread or the split's front waits for the host
++// GPU to finish them. Off: nothing changes. On, stage by stage: they are counted here per frame
++// (RasterizerVulkan::TickFrame logs them every 600 frames); the device opens a second queue and
++// the scheduler a second command stream for them (vulkan_device.h HasDependencyQueue,
++// vk_scheduler.h DependencyLane); they are routed there and the waits follow them.
++inline bool Nx2DepQueueEnabled() {
++    static const bool enabled = [] {
++        const char* value = std::getenv("EDEN_NX2_ASYNC_DEP_QUEUE");
++        return value != nullptr && value[0] == '1';
++    }();
++    return enabled;
++}
++
++/// Counted while EDEN_NX2_ASYNC_DEP_QUEUE is on; TickFrame logs and resets them.
++inline std::atomic<u64> g_nx2_dep_producer_dispatches{};
++inline std::atomic<u64> g_nx2_dep_producer_copies{};
++inline std::atomic<u64> g_nx2_dep_routed_dispatches{}; ///< Recorded on the dependency lane
++
+ /// A new emulation session starts: no page has been written by its GPU yet.
+ inline void Nx2ClearGpuWrittenPages() {
+     for (auto& word : g_nx2_gpu_written_pages) {
+diff --git a/src/video_core/renderer_vulkan/vk_rasterizer.cpp b/src/video_core/renderer_vulkan/vk_rasterizer.cpp
+index 7d1eef6..109c1b6 100644
+--- a/src/video_core/renderer_vulkan/vk_rasterizer.cpp
++++ b/src/video_core/renderer_vulkan/vk_rasterizer.cpp
+@@ -1800,6 +1800,13 @@ void RasterizerVulkan::DispatchCompute() {
+                      inputs, gpu_written_inputs);
+         }
+     }
++    // EDEN_NX2_ASYNC_DEP_QUEUE: this dispatch writes a page the CPU reads or a command list page
++    // (Nx2NoteListWrite queued a copy of it): the host GPU will be waited for it.
++    [[maybe_unused]] const bool dependency_producer =
++        Tegra::Nx2DepQueueEnabled() && buffer_cache.Nx2HasListCopyRequests();
++    if (dependency_producer) {
++        Tegra::g_nx2_dep_producer_dispatches.fetch_add(1, std::memory_order_relaxed);
++    }
+     SCOPE_EXIT {
+         if (!frame_dump.Capturing()) {
+             return;
+@@ -2780,6 +2787,19 @@ void RasterizerVulkan::FrameDumpPass(const Framebuffer* framebuffer) {
+ }
+ 
+ void RasterizerVulkan::TickFrame() {
++    if (Tegra::Nx2DepQueueEnabled()) {
++        static u64 frames{};
++        if (++frames % 600 == 0) {
++            const u64 dispatches =
++                Tegra::g_nx2_dep_producer_dispatches.exchange(0, std::memory_order_relaxed);
++            const u64 copies = Tegra::g_nx2_dep_producer_copies.exchange(0, std::memory_order_relaxed);
++            const u64 routed = Tegra::g_nx2_dep_routed_dispatches.exchange(0, std::memory_order_relaxed);
++            LOG_INFO(Render_Vulkan,
++                     "Dependency queue, last 600 frames: {} producer dispatches ({:.1f}/frame), {} "
++                     "producer copies ({:.1f}/frame), {} dispatches routed ({:.1f}/frame)",
++                     dispatches, dispatches / 600.0, copies, copies / 600.0, routed, routed / 600.0);
++        }
++    }
+     if (VideoCore::Nx2Debug::HasRequests()) {
+         if (auto capture = VideoCore::Nx2Debug::TakeCapture()) {
+             frame_dump.Arm(std::move(capture->directory), capture->sampled, capture->buffers,
+@@ -3143,6 +3163,9 @@ bool AccelerateDMA::BufferCopy(GPUVAddr src_address, GPUVAddr dest_address, u64
+     std::scoped_lock lock{buffer_cache.mutex};
+     buffer_cache.Nx2CollectListCopies(true, true);
+     const bool copied = buffer_cache.DMACopy(src_address, dest_address, amount);
++    if (Tegra::Nx2DepQueueEnabled() && buffer_cache.Nx2HasListCopyRequests()) {
++        Tegra::g_nx2_dep_producer_copies.fetch_add(1, std::memory_order_relaxed);
++    }
+     if (buffer_cache.Nx2CopyListPages(scheduler.CurrentTick())) {
+         scheduler.Flush();
+     }
