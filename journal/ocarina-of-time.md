@@ -89,6 +89,18 @@ Duas correções implementadas, cada uma atrás de uma chave:
 - `EDEN_MAC_FAST_FP=1`: tira o `NoContraction` no caminho do MoltenVK, para os shaders voltarem a ser código inlinável.
 - `EDEN_MAC_NO_OCCLUSION=<n>`: reduz o acúmulo de occlusion queries depois de cada render pass.
 
+### Primeiro resultado: `EDEN_MAC_FAST_FP=1`
+
+| Medida | Antes | Com `EDEN_MAC_FAST_FP=1` |
+|---|---|---|
+| Jogo, varanda em Kokiri | 5,9 fps | ~18,5 fps |
+| Tempo de quadro (vi2) | 170 a 178 ms | 54 ms |
+| Barra de status do Lichii | 6 fps | 19 fps / 52 ms |
+
+O ganho foi de três vezes, mexendo só na decoração de ponto flutuante. Os 808 shaders recompilados ficaram sem nenhuma chamada a `spvFMul`/`spvFAdd`. Na primeira abertura depois da mudança o Lichii recompila ~800 pipelines e o menu demora 326 s para aparecer, contra 85 s antes. Isso acontece uma vez só; nas aberturas seguintes os pipelines saem do cache.
+
+Uma nota de método: nessa rodada o script de medição imprimiu 1,4 fps por um bug. Ele pegava o instante da última linha do log, que às vezes vem colada a outra linha escrita ao mesmo tempo. Corrigido para usar o instante da mesma linha do contador de quadros.
+
 ### Próximos passos
 
 _Em andamento: identificar o shader de 58 ms e o limitador dele nos contadores da GPU, explicar os 195 render passes e corrigir, com cada mudança atrás de uma chave `EDEN_MAC_*` e medida no save._
