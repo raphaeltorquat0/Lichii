@@ -155,6 +155,12 @@ Tentativa descartada: um `simdgroup_barrier(mem_none)` no início de cada HMMA e
 
 O Lichii já emite o HMMA como `OpFunction` com `DontInline`. Quem descarta essa marca é o SPIRV-Cross dentro do MoltenVK: ele gera `static inline __attribute__((always_inline))`. Próximo passo: compilar o MoltenVK localmente com o SPIRV-Cross honrando `DontInline`, e medir o spill e o fps.
 
+### O MoltenVK que o Lichii usa de verdade
+
+Para o MoltenVK local, a primeira rodada de controle (fábrica + `FAST_FP`, MoltenVK 1.4.2 oficial compilado aqui, carregado por `LIBVULKAN_PATH`) deu 7,3 fps (~132 ms), e não 9,6. O motivo: o Lichii nunca usou o MoltenVK do Homebrew. O `.app` traz o próprio `libMoltenVK`, que é o fork do Ryujinx, v1.4.1 (`cpmfile.json:172-176`, artefato `moltenvk@v1.4.1-ryujinx`). Todas as medições anteriores rodaram com esse fork, que aqui é ~30% mais rápido que o 1.4.2 oficial. A comparação do patch do SPIRV-Cross fica então contra essa base de 7,3 fps, com a mesma biblioteca. Se o patch ganhar, ele precisa ser portado para o fork do Ryujinx.
+
+O patch: o SPIRV-Cross passa a guardar o `FunctionControl` no parser, e o `CompilerMSL` emite `static __attribute__((noinline))` quando a função tem `DontInline` e a opção está ligada (`MVK_CONFIG_SPIRV_HONOR_DONTINLINE=1`).
+
 ### Onde paramos no Mac
 
 | Mac, Kokiri | Sem correção | `EDEN_MAC_FAST_FP=1` |
