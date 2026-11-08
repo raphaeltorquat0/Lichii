@@ -1,0 +1,24 @@
+--- a/src/core/hle/service/nx2_gsv.h	2026-11-08 02:31:41
++++ b/src/core/hle/service/nx2_gsv.h	2026-11-08 02:31:41
+@@ -1803,10 +1803,19 @@
+             // commands, then crashes, with a slow GPU). Wait for this frame too then. Not when a
+             // suspended channel brought us here: this frame can't finish before the present
+             // returns.
+-            const bool gpu_behind = frames_ahead == 1 && m_previous_fence_id < 192 &&
++            // Steam Deck build, EDEN_NX2_RUN_AHEAD: 1 keeps running a frame ahead even while the GPU
++            // is behind (on the Deck the frame is a latency chain, not a saturated GPU, and the
++            // wait below serialised CPU and GPU); 2 also skips the previous frame's fence.
++            static const int run_ahead = [] {
++                const char* value = std::getenv("EDEN_NX2_RUN_AHEAD");
++                return value == nullptr ? 0 : std::atoi(value);
++            }();
++            const bool gpu_behind = run_ahead == 0 && frames_ahead == 1 && m_previous_fence_id < 192 &&
+                                     !system.Host1x().GetSyncpointManager().IsReadyGuest(
+                                         m_previous_fence_id, m_previous_fence_value);
+-            WaitForFrame(m_previous_fence_id, m_previous_fence_value);
++            if (run_ahead < 2) {
++                WaitForFrame(m_previous_fence_id, m_previous_fence_value);
++            }
+             if (gpu_behind) {
+                 WaitForFrame(~w[22], w[24]);
+             }
