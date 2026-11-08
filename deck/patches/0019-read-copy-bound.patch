@@ -1,0 +1,67 @@
+diff --git a/src/video_core/buffer_cache/buffer_cache.h b/src/video_core/buffer_cache/buffer_cache.h
+index 29e429d..9870695 100644
+--- a/src/video_core/buffer_cache/buffer_cache.h
++++ b/src/video_core/buffer_cache/buffer_cache.h
+@@ -330,7 +330,11 @@ std::optional<VideoCore::RasterizerDownloadArea> BufferCache<P>::GetFlushArea(DA
+                 Tegra::g_nx2_ampere.load(std::memory_order_relaxed)) {
+                 for (DAddr page = device_addr_start_aligned; page < device_addr_end_aligned;
+                      page += DAddr{1} << Tegra::Nx2WrittenPageBits) {
+-                    Tegra::Nx2MarkCommandListPage(page);
++                    // On a page's second read: pages read once (hundreds during the title
++                    // screen and loading) stay on the generic path and get no copies.
++                    if (!nx2_cpu_read_pages_seen.insert(page).second) {
++                        Tegra::Nx2MarkCommandListPage(page);
++                    }
+                 }
+             }
+         }
+@@ -2168,7 +2172,22 @@ bool BufferCache<P>::Nx2CopyListPages(u64 tick) {
+             if (begin >= end) {
+                 continue;
+             }
+-            Nx2Staging staging = runtime.DownloadStagingBuffer(page_size, true);
++            // A page the CPU reads (EDEN_NX2_READ_COPY) can be written by many dispatches a frame
++            // (the title screen's network writes its statistics pages all frame long): a fresh
++            // 4 KiB staging buffer per write, each retired until the GPU passed its tick, grew the
++            // process by gigabytes. Reuse the page's own copy once the GPU is done with it.
++            std::optional<Nx2Staging> reused;
++            {
++                std::scoped_lock lock{nx2_list_mutex};
++                const auto it = nx2_list_pages.find(page);
++                if (it != nx2_list_pages.end() && it->second.copy &&
++                    runtime.IsFree(it->second.copy_tick)) {
++                    reused = *it->second.copy;
++                    it->second.copy.reset();
++                }
++            }
++            const Nx2Staging staging =
++                reused ? *reused : runtime.DownloadStagingBuffer(page_size, true);
+             const BufferCopy copy{
+                 .src_offset = buffer.Offset(begin),
+                 .dst_offset = staging.offset + (begin - page),
+@@ -2189,6 +2208,11 @@ bool BufferCache<P>::Nx2CopyListPages(u64 tick) {
+             entry.copy_end = static_cast<u32>(end - page);
+         }
+         nx2_list_copy_requests.clear();
++        // Bound the copies waiting for the GPU: past the cap, wait for the oldest (they retire
++        // in tick order) so the loop below frees them instead of the pool growing on.
++        if (nx2_retired_list_copies.size() > 256) {
++            runtime.Wait(nx2_retired_list_copies.front().first);
++        }
+         std::erase_if(nx2_retired_list_copies, [this](auto& retired) {
+             if (!runtime.IsFree(retired.first)) {
+                 return false;
+diff --git a/src/video_core/buffer_cache/buffer_cache_base.h b/src/video_core/buffer_cache/buffer_cache_base.h
+index 73a1a76..632f827 100644
+--- a/src/video_core/buffer_cache/buffer_cache_base.h
++++ b/src/video_core/buffer_cache/buffer_cache_base.h
+@@ -474,6 +474,9 @@ public:
+     bool any_buffer_uploaded = false;
+     /// Indirectly read banks of native programs already uploaded this frame.
+     std::unordered_set<DAddr> native_indirect_uniforms_this_frame;
++    /// EDEN_NX2_READ_COPY / dependency queue: GPU-written pages the CPU has read at least once
++    /// (GetFlushArea, under `mutex`); the second read marks the page for copies.
++    std::unordered_set<DAddr> nx2_cpu_read_pages_seen;
+ 
+ private:
+     template <typename Mask, typename Func>
