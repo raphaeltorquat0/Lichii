@@ -1,0 +1,145 @@
+diff --git a/src/video_core/buffer_cache/buffer_cache.h b/src/video_core/buffer_cache/buffer_cache.h
+index 1b6ddd0..6f38961 100644
+--- a/src/video_core/buffer_cache/buffer_cache.h
++++ b/src/video_core/buffer_cache/buffer_cache.h
+@@ -2110,7 +2110,8 @@ void BufferCache<P>::Nx2NoteListWrite(BufferId buffer_id, DAddr device_addr, u64
+                 }
+                 if (Tegra::Nx2CmdPageDiag::g_enabled) {
+                     Tegra::Nx2CmdPageDiag::NoteWrite(page_addr, device_addr, size,
+-                                                     !nx2_collect_list_copies);
++                                                     !nx2_collect_list_copies,
++                                                     nx2_collect_from_copy);
+                 }
+             }
+             ++page;
+diff --git a/src/video_core/buffer_cache/buffer_cache_base.h b/src/video_core/buffer_cache/buffer_cache_base.h
+index 2afb361..4573fe0 100644
+--- a/src/video_core/buffer_cache/buffer_cache_base.h
++++ b/src/video_core/buffer_cache/buffer_cache_base.h
+@@ -360,12 +360,17 @@ public:
+     /// Switch 2 GPU-written command lists (nx2.h, g_nx2_command_list_pages). While collecting (a
+     /// compute dispatch or a DMA copy being recorded), writes to command list pages are noted;
+     /// Nx2CopyListPages then records copies of those pages into host memory after the work.
+-    void Nx2CollectListCopies(bool collect) {
++    void Nx2CollectListCopies(bool collect, bool from_copy = false) {
+         nx2_collect_list_copies = collect;
++        nx2_collect_from_copy = collect && from_copy;
+         if (!collect) {
+             nx2_list_copy_requests.clear();
+         }
+     }
++    /// While collecting: whether the work being recorded wrote a command list page.
++    [[nodiscard]] bool Nx2HasListCopyRequests() const noexcept {
++        return !nx2_list_copy_requests.empty();
++    }
+     /// True when it recorded copies, which the GPU completes at `tick` (the caller submits).
+     bool Nx2CopyListPages(u64 tick);
+     enum class Nx2ListRead { Unknown, Copied, Synced, NeedsSync };
+@@ -805,6 +810,7 @@ private:
+     std::vector<std::pair<u64, Nx2Staging>> nx2_retired_list_copies;
+     boost::container::small_vector<std::pair<BufferId, DAddr>, 8> nx2_list_copy_requests;
+     bool nx2_collect_list_copies{};
++    bool nx2_collect_from_copy{}; ///< Collecting for a DMA copy (else a compute dispatch)
+ };
+ 
+ } // namespace VideoCommon
+diff --git a/src/video_core/nx2_cmdpage_diag.h b/src/video_core/nx2_cmdpage_diag.h
+index df5c364..3c0fb70 100644
+--- a/src/video_core/nx2_cmdpage_diag.h
++++ b/src/video_core/nx2_cmdpage_diag.h
+@@ -81,7 +81,8 @@ struct State {
+     std::atomic<u64> reads_unknown_draw{};
+     std::atomic<u64> draw_writes{};
+     std::atomic<u64> draw_writes_whole_page{};
+-    std::atomic<u64> other_writes{};
++    std::atomic<u64> other_writes{}; ///< Compute dispatches
++    std::atomic<u64> copy_writes{};  ///< DMA copies
+     std::atomic<u64> sync_waits{};
+     std::atomic<u64> sync_wait_ns{};
+     std::atomic<u64> missed_on_entry{};
+@@ -106,7 +107,7 @@ inline u64 Take(std::atomic<u64>& counter) {
+ }
+ 
+ /// The back: GPU work wrote [device_addr, device_addr + size) over the list page at page_addr.
+-inline void NoteWrite(u64 page_addr, u64 device_addr, u64 size, bool draw) {
++inline void NoteWrite(u64 page_addr, u64 device_addr, u64 size, bool draw, bool copy = false) {
+     State& state = Get();
+     const u64 begin = (std::max)(device_addr, page_addr) - page_addr;
+     const u64 end = (std::min)(device_addr + size, page_addr + PageBytes) - page_addr;
+@@ -115,6 +116,8 @@ inline void NoteWrite(u64 page_addr, u64 device_addr, u64 size, bool draw) {
+         if (begin == 0 && end == PageBytes) {
+             state.draw_writes_whole_page.fetch_add(1, std::memory_order_relaxed);
+         }
++    } else if (copy) {
++        state.copy_writes.fetch_add(1, std::memory_order_relaxed);
+     } else {
+         state.other_writes.fetch_add(1, std::memory_order_relaxed);
+     }
+@@ -250,8 +253,8 @@ inline void Log() {
+              "{} flushed {} in {:.1f} ms | slow by writer (entries/changed): {} {}/{}, {} {}/{}, "
+              "{} {}/{}, {} {}/{}, {} {}/{}; changed words {} | list page reads copied {} synced "
+              "{} unknown {} (on draw pages {}) | sync waits {} in {:.1f} ms | missed draw writes "
+-             "on entry {} elsewhere {} | list page writes draw {} (whole page {}) dispatch/copy "
+-             "{}; draw-written list pages {} | macro DMA reads {} (on GPU-written pages {}), "
++             "on entry {} elsewhere {} | list page writes draw {} (whole page {}) dispatch {} "
++             "copy {}; draw-written list pages {} | macro DMA reads {} (on GPU-written pages {}), "
+              "changed by the drain {} (on GPU-written pages {})",
+              seconds, path(Path::Submitted), path(Path::Safe), path(Path::Copy), path(Path::Slow),
+              Take(state.slow_drained), Take(state.slow_flushed),
+@@ -262,7 +265,8 @@ inline void Log() {
+              Take(state.reads_unknown), Take(state.reads_unknown_draw), Take(state.sync_waits),
+              static_cast<double>(Take(state.sync_wait_ns)) / 1e6, Take(state.missed_on_entry),
+              Take(state.missed_elsewhere), Take(state.draw_writes),
+-             Take(state.draw_writes_whole_page), Take(state.other_writes), draw_pages,
++             Take(state.draw_writes_whole_page), Take(state.other_writes),
++             Take(state.copy_writes), draw_pages,
+              Take(state.dma_reads), Take(state.dma_reads_gpu_pages), Take(state.dma_reads_changed),
+              Take(state.dma_reads_changed_gpu_pages));
+ }
+diff --git a/src/video_core/renderer_vulkan/vk_rasterizer.cpp b/src/video_core/renderer_vulkan/vk_rasterizer.cpp
+index 74cdcd6..a13d00f 100644
+--- a/src/video_core/renderer_vulkan/vk_rasterizer.cpp
++++ b/src/video_core/renderer_vulkan/vk_rasterizer.cpp
+@@ -1770,6 +1770,33 @@ void RasterizerVulkan::DispatchCompute() {
+         if (kepler_compute->IsNativeMode()) throw Shader::RuntimeError("Native compute resources unavailable");
+         return;
+     }
++    // EDEN_NX2_CMDPAGE_DIAG: a dispatch that writes a command list page (or a page the CPU reads,
++    // EDEN_NX2_READ_COPY) could run on a compute queue ahead of the graphics backlog only if none
++    // of its storage inputs was written by GPU work: log, once per program, how many were.
++    if (Tegra::Nx2CmdPageDiag::g_enabled && buffer_cache.Nx2HasListCopyRequests()) [[unlikely]] {
++        u32 inputs{};
++        u32 gpu_written_inputs{};
++        buffer_cache.ForEachBoundBuffer(true, [&](u32, bool storage, u32, bool written,
++                                                  const auto& binding, u32 bound_size,
++                                                  const auto*, u32) {
++            if (!storage || written) {
++                return;
++            }
++            ++inputs;
++            if (buffer_cache.IsRegionGpuModified(binding.device_addr, bound_size)) {
++                ++gpu_written_inputs;
++            }
++        });
++        static std::set<u64> logged;
++        if (logged.size() < 64 && logged.insert(pipeline->ShaderHash()).second) {
++            const auto& qmd = kepler_compute->launch_description;
++            LOG_INFO(HW_GPU,
++                     "cmdpage diag: list-page writer {:016x} grid {}x{}x{}: {} storage inputs, "
++                     "{} of them GPU-written",
++                     pipeline->ShaderHash(), qmd.grid_dim_x, qmd.grid_dim_y, qmd.grid_dim_z,
++                     inputs, gpu_written_inputs);
++        }
++    }
+     SCOPE_EXIT {
+         if (!frame_dump.Capturing()) {
+             return;
+@@ -3111,7 +3138,7 @@ bool AccelerateDMA::BufferClear(GPUVAddr src_address, u64 amount, u32 value) {
+ 
+ bool AccelerateDMA::BufferCopy(GPUVAddr src_address, GPUVAddr dest_address, u64 amount) {
+     std::scoped_lock lock{buffer_cache.mutex};
+-    buffer_cache.Nx2CollectListCopies(true);
++    buffer_cache.Nx2CollectListCopies(true, true);
+     const bool copied = buffer_cache.DMACopy(src_address, dest_address, amount);
+     if (buffer_cache.Nx2CopyListPages(scheduler.CurrentTick())) {
+         scheduler.Flush();

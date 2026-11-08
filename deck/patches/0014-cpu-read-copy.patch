@@ -1,0 +1,158 @@
+diff --git a/dist/nx2_switches.txt b/dist/nx2_switches.txt
+index d0596ab..7926f15 100644
+--- a/dist/nx2_switches.txt
++++ b/dist/nx2_switches.txt
+@@ -40,6 +40,12 @@ EDEN_NX2_FENCE_BATCH=1
+ # behaviour for Switch 1 titles): only the first read of a GPU-written page waits for the GPU.
+ #EDEN_NX2_PREFLUSH=1
+ 
++# Pages the CPU reads after the GPU wrote them are copied to host memory right after the dispatch
++# or DMA copy that writes them (as GPU-written command list pages are); a CPU read then waits
++# only for that work's GPU tick, not for everything recorded since (Scheduler::Finish). Exact
++# data; the first read of each page still takes the generic path.
++#EDEN_NX2_READ_COPY=1
++
+ # Semaphore acquires read the word without draining the split's back first (the back's own
+ # releases still latch the waiter). Lets the front run ahead of the back while a channel waits
+ # on a CPU-released semaphore (Ocarina of Time, most of every frame).
+diff --git a/src/video_core/buffer_cache/buffer_cache.h b/src/video_core/buffer_cache/buffer_cache.h
+index 1b6ddd0..b8ec891 100644
+--- a/src/video_core/buffer_cache/buffer_cache.h
++++ b/src/video_core/buffer_cache/buffer_cache.h
+@@ -33,6 +33,19 @@ namespace VideoCommon {
+ 
+ using Core::DEVICE_PAGESIZE;
+ 
++// EDEN_NX2_READ_COPY=1 (Switch 2 titles): a page the guest CPU reads after the GPU wrote it is
++// marked like a GPU-written command list page (nx2.h). From then on the compute dispatch or DMA
++// copy that writes it also copies it to host memory right after (Nx2CopyListPages), and the next
++// CPU read is served from that copy once the GPU is past the writer's tick, instead of
++// FinishForHostRead (submit everything recorded so far and wait for all of it).
++inline bool Nx2ReadCopyEnabled() {
++    static const bool enabled = [] {
++        const char* value = std::getenv("EDEN_NX2_READ_COPY");
++        return value != nullptr && value[0] == '1';
++    }();
++    return enabled;
++}
++
+ template <class P>
+ BufferCache<P>::BufferCache(Tegra::MaxwellDeviceMemoryManager& device_memory_, Runtime& runtime_)
+     : runtime{runtime_}, device_memory{device_memory_}, memory_tracker{device_memory} {
+@@ -311,6 +324,13 @@ std::optional<VideoCore::RasterizerDownloadArea> BufferCache<P>::GetFlushArea(DA
+             // really rearms the core instead of being skipped by the deduplication cache.
+             read_trapped_ranges.Subtract(
+                 device_addr_start_aligned, device_addr_end_aligned - device_addr_start_aligned);
++            // The next writer copies these pages to host memory (Nx2DownloadFromListCopies).
++            if (Nx2ReadCopyEnabled() && Tegra::g_nx2_ampere.load(std::memory_order_relaxed)) {
++                for (DAddr page = device_addr_start_aligned; page < device_addr_end_aligned;
++                     page += DAddr{1} << Tegra::Nx2WrittenPageBits) {
++                    Tegra::Nx2MarkCommandListPage(page);
++                }
++            }
+         }
+     } else {
+         // The core keeps this area and has no mark. The next GPU write here must arm the range
+@@ -323,6 +343,9 @@ std::optional<VideoCore::RasterizerDownloadArea> BufferCache<P>::GetFlushArea(DA
+ 
+ template <class P>
+ void BufferCache<P>::DownloadMemory(DAddr device_addr, u64 size) {
++    if (Nx2ReadCopyEnabled() && Nx2DownloadFromListCopies(device_addr, size)) {
++        return;
++    }
+     if constexpr (USE_MEMORY_MAPS) {
+         if (download_cpu_read_ranges) {
+             download_cpu_read_ranges = false;
+@@ -2239,6 +2262,77 @@ auto BufferCache<P>::Nx2ReadListCopy(DAddr device_addr, std::span<u8> out, bool
+     }
+ }
+ 
++template <class P>
++bool BufferCache<P>::Nx2DownloadFromListCopies(DAddr device_addr, u64 size) {
++    if constexpr (IS_OPENGL) {
++        return false;
++    } else {
++        if (size == 0 || !Tegra::g_nx2_has_command_list_pages.load(std::memory_order_relaxed)) {
++            return false;
++        }
++        constexpr DAddr page_size = DAddr{1} << Tegra::Nx2WrittenPageBits;
++        struct Part {
++            DAddr page;
++            u64 tick;
++            u32 begin;
++            u32 end;
++            const u8* data;
++        };
++        boost::container::small_vector<Part, 4> parts;
++        {
++            // Back thread: Nx2CopyListPages (the only writer of these entries) runs on it too, so
++            // the copies found here stay until this returns.
++            std::scoped_lock lock{nx2_list_mutex};
++            for (DAddr page = device_addr & ~(page_size - 1); page < device_addr + size;
++                 page += page_size) {
++                const auto it = nx2_list_pages.find(page);
++                if (it == nx2_list_pages.end()) {
++                    return false;
++                }
++                const Nx2ListPage& entry = it->second;
++                // No copy, a write outside a dispatch or DMA copy, or a write since the copy:
++                // the generic download (FinishForHostRead) stays right.
++                if (!entry.copy || entry.draw_written || entry.copy_writes != entry.writes) {
++                    return false;
++                }
++                parts.push_back({page, entry.copy_tick, entry.copy_begin, entry.copy_end,
++                                 entry.copy->mapped_span.data()});
++            }
++        }
++        // Every GPU-written byte of the pages must be within what their copies hold.
++        bool covered = true;
++        for (const Part& part : parts) {
++            gpu_modified_ranges.ForEachInRange(part.page, page_size, [&](DAddr start, DAddr end) {
++                covered &= start >= part.page + part.begin && end <= part.page + part.end;
++            });
++        }
++        if (!covered) {
++            return false;
++        }
++        // The copy went out with the work that wrote the page (SubmitNx2ListCopies): wait for
++        // that tick only, not for everything recorded since. Scheduler::Wait submits the tick
++        // itself if it is still open (this is the back thread: nobody else would).
++        for (const Part& part : parts) {
++            if (!runtime.IsFree(part.tick)) {
++                runtime.Wait(part.tick);
++            }
++        }
++        const Common::RangeSet<DAddr> cpu_written = PendingCpuWriteRanges();
++        for (const Part& part : parts) {
++            gpu_modified_ranges.ForEachInRange(part.page, page_size, [&](DAddr start, DAddr end) {
++                WriteDownloadedMemory(cpu_written, start, part.data + (start - part.page),
++                                      end - start);
++            });
++            memory_tracker.ForEachDownloadRangeAndClear(
++                part.page, page_size, [&](u64 range_addr, u64 range_size) {
++                    ClearDownload(range_addr, range_size);
++                    gpu_modified_ranges.Subtract(range_addr, range_size);
++                });
++        }
++        return true;
++    }
++}
++
+ template <class P>
+ void BufferCache<P>::Nx2NoteListSynced(DAddr page) {
+     if constexpr (!IS_OPENGL) {
+diff --git a/src/video_core/buffer_cache/buffer_cache_base.h b/src/video_core/buffer_cache/buffer_cache_base.h
+index 2afb361..1e43a93 100644
+--- a/src/video_core/buffer_cache/buffer_cache_base.h
++++ b/src/video_core/buffer_cache/buffer_cache_base.h
+@@ -377,6 +377,10 @@ public:
+     Nx2ListRead Nx2ReadListCopy(DAddr device_addr, std::span<u8> out, bool past_sync);
+     /// Front thread, the split drained: the command list page was flushed to guest memory.
+     void Nx2NoteListSynced(DAddr page);
++    /// Back thread (EDEN_NX2_READ_COPY): writes the GPU-written bytes of the pages over
++    /// [device_addr, device_addr + size) to guest memory from their list copies, waiting only
++    /// for the GPU tick of the work that wrote them. False when any page has no current copy.
++    bool Nx2DownloadFromListCopies(DAddr device_addr, u64 size);
+ 
+     void Nx2FlushListPages(std::span<const DAddr> pages);
+     /// CPU and inline writes: they reach guest memory, so a synced page stays synced, but its copy
