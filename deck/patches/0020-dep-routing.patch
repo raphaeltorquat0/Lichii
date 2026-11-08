@@ -1,0 +1,520 @@
+diff --git a/src/video_core/buffer_cache/buffer_cache.h b/src/video_core/buffer_cache/buffer_cache.h
+index 9870695..b95d01d 100644
+--- a/src/video_core/buffer_cache/buffer_cache.h
++++ b/src/video_core/buffer_cache/buffer_cache.h
+@@ -2148,8 +2148,53 @@ void BufferCache<P>::Nx2NoteListWrite(BufferId buffer_id, DAddr device_addr, u64
+     }
+ }
+ 
++template <class P>
++bool BufferCache<P>::Nx2CopyDone(u64 tick) {
++    if constexpr (requires { runtime.IsDependencyFree(u64{}); }) {
++        if ((tick & Nx2LaneTickBit) != 0) {
++            return runtime.IsDependencyFree(tick & ~Nx2LaneTickBit);
++        }
++    }
++    return runtime.IsFree(tick);
++}
++
++template <class P>
++void BufferCache<P>::Nx2WaitCopy(u64 tick, bool front) {
++    if constexpr (requires { runtime.WaitDependency(u64{}); }) {
++        if ((tick & Nx2LaneTickBit) != 0) {
++            runtime.WaitDependency(tick & ~Nx2LaneTickBit);
++            return;
++        }
++    }
++    if (front) {
++        runtime.WaitSubmittedTick(tick);
++    } else {
++        runtime.Wait(tick);
++    }
++}
++
+ template <class P>
+ bool BufferCache<P>::Nx2CopyListPages(u64 tick) {
++    return Nx2CopyListPagesImpl(tick, [this](const Nx2Staging& staging, Buffer& buffer,
++                                             const BufferCopy& copy) {
++        runtime.CopyBuffer(staging.buffer, buffer, std::span{&copy, 1}, true);
++    });
++}
++
++template <class P>
++template <typename CmdBuf>
++bool BufferCache<P>::Nx2CopyListPagesInto(CmdBuf cmdbuf, u64 lane_tick) {
++    return Nx2CopyListPagesImpl(lane_tick | Nx2LaneTickBit,
++                                [this, cmdbuf](const Nx2Staging& staging, Buffer& buffer,
++                                               const BufferCopy& copy) {
++                                    runtime.CopyBufferInto(cmdbuf, staging.buffer, buffer,
++                                                           std::span{&copy, 1});
++                                });
++}
++
++template <class P>
++template <typename Record>
++bool BufferCache<P>::Nx2CopyListPagesImpl(u64 tick, Record&& record) {
+     if constexpr (IS_OPENGL) {
+         return false;
+     } else {
+@@ -2181,7 +2226,7 @@ bool BufferCache<P>::Nx2CopyListPages(u64 tick) {
+                 std::scoped_lock lock{nx2_list_mutex};
+                 const auto it = nx2_list_pages.find(page);
+                 if (it != nx2_list_pages.end() && it->second.copy &&
+-                    runtime.IsFree(it->second.copy_tick)) {
++                    Nx2CopyDone(it->second.copy_tick)) {
+                     reused = *it->second.copy;
+                     it->second.copy.reset();
+                 }
+@@ -2194,7 +2239,7 @@ bool BufferCache<P>::Nx2CopyListPages(u64 tick) {
+                 .size = end - begin,
+             };
+             buffer.MarkUsage(copy.src_offset, copy.size);
+-            runtime.CopyBuffer(staging.buffer, buffer, std::span{&copy, 1}, true);
++            record(staging, buffer, copy);
+             recorded = true;
+             std::scoped_lock lock{nx2_list_mutex};
+             Nx2ListPage& entry = nx2_list_pages[page];
+@@ -2211,10 +2256,10 @@ bool BufferCache<P>::Nx2CopyListPages(u64 tick) {
+         // Bound the copies waiting for the GPU: past the cap, wait for the oldest (they retire
+         // in tick order) so the loop below frees them instead of the pool growing on.
+         if (nx2_retired_list_copies.size() > 256) {
+-            runtime.Wait(nx2_retired_list_copies.front().first);
++            Nx2WaitCopy(nx2_retired_list_copies.front().first, false);
+         }
+         std::erase_if(nx2_retired_list_copies, [this](auto& retired) {
+-            if (!runtime.IsFree(retired.first)) {
++            if (!Nx2CopyDone(retired.first)) {
+                 return false;
+             }
+             runtime.FreeDeferredStagingBuffer(retired.second);
+@@ -2269,15 +2314,16 @@ auto BufferCache<P>::Nx2ReadListCopy(DAddr device_addr, std::span<u8> out, bool
+                 return Nx2ListRead::Unknown;
+             }
+             // The lists after the first of a batch find the copy done: read it at once.
+-            if (runtime.IsFree(entry.copy_tick)) {
++            if (Nx2CopyDone(entry.copy_tick)) {
+                 std::memcpy(out.data(), entry.copy->mapped_span.data() + offset, out.size());
+                 return Nx2ListRead::Copied;
+             }
+             tick = entry.copy_tick;
+             writes = entry.copy_writes;
+         }
+-        // Submitted with the work that wrote the page (Nx2CopyListPages's caller flushes).
+-        runtime.WaitSubmittedTick(tick);
++        // Submitted with the work that wrote the page (Nx2CopyListPages's caller flushes), or
++        // on the dependency lane (Nx2CopyListPagesInto).
++        Nx2WaitCopy(tick, true);
+         std::scoped_lock lock{nx2_list_mutex};
+         const auto it = nx2_list_pages.find(page);
+         if (it == nx2_list_pages.end() || !current(it->second) || it->second.copy_tick != tick ||
+@@ -2340,8 +2386,8 @@ bool BufferCache<P>::Nx2DownloadFromListCopies(DAddr device_addr, u64 size) {
+         // that tick only, not for everything recorded since. Scheduler::Wait submits the tick
+         // itself if it is still open (this is the back thread: nobody else would).
+         for (const Part& part : parts) {
+-            if (!runtime.IsFree(part.tick)) {
+-                runtime.Wait(part.tick);
++            if (!Nx2CopyDone(part.tick)) {
++                Nx2WaitCopy(part.tick, false);
+             }
+         }
+         const Common::RangeSet<DAddr> cpu_written = PendingCpuWriteRanges();
+diff --git a/src/video_core/buffer_cache/buffer_cache_base.h b/src/video_core/buffer_cache/buffer_cache_base.h
+index 632f827..92e8b32 100644
+--- a/src/video_core/buffer_cache/buffer_cache_base.h
++++ b/src/video_core/buffer_cache/buffer_cache_base.h
+@@ -373,6 +373,18 @@ public:
+     }
+     /// True when it recorded copies, which the GPU completes at `tick` (the caller submits).
+     bool Nx2CopyListPages(u64 tick);
++    /// EDEN_NX2_ASYNC_DEP_QUEUE: as Nx2CopyListPages, but recorded now into the dependency
++    /// lane's command buffer; the copies complete at lane tick `lane_tick`, stored with
++    /// Nx2LaneTickBit so readers wait on the lane's timeline (Nx2CopyDone, Nx2WaitCopy).
++    template <typename CmdBuf>
++    bool Nx2CopyListPagesInto(CmdBuf cmdbuf, u64 lane_tick);
++    static constexpr u64 Nx2LaneTickBit = u64{1} << 63;
++    /// Whether the GPU completed the copy made at `tick` (a main tick, or a lane tick + bit).
++    bool Nx2CopyDone(u64 tick);
++    /// Waits for it; `front`: the split's front thread (no flush of the main stream).
++    void Nx2WaitCopy(u64 tick, bool front);
++    template <typename Record>
++    bool Nx2CopyListPagesImpl(u64 tick, Record&& record);
+     enum class Nx2ListRead { Unknown, Copied, Synced, NeedsSync };
+     /// Front thread: Synced when guest memory holds the page `device_addr` lies in (flushed and
+     /// written by no GPU work since), else Copied with `out` filled from the copy of its last
+diff --git a/src/video_core/renderer_vulkan/vk_buffer_cache.cpp b/src/video_core/renderer_vulkan/vk_buffer_cache.cpp
+index 8e51116..19104cc 100644
+--- a/src/video_core/renderer_vulkan/vk_buffer_cache.cpp
++++ b/src/video_core/renderer_vulkan/vk_buffer_cache.cpp
+@@ -484,6 +484,50 @@ void BufferCacheRuntime::Wait(u64 tick) {
+     scheduler.Wait(tick);
+ }
+ 
++bool BufferCacheRuntime::HasDependencyLane() {
++    return scheduler.HasDependencyLane();
++}
++
++bool BufferCacheRuntime::IsDependencyFree(u64 lane_tick) {
++    return scheduler.IsDependencyFree(lane_tick);
++}
++
++void BufferCacheRuntime::WaitDependency(u64 lane_tick) {
++    scheduler.WaitDependency(lane_tick);
++}
++
++void BufferCacheRuntime::CopyBufferInto(vk::CommandBuffer cmdbuf, VkBuffer dst_buffer,
++                                        VkBuffer src_buffer,
++                                        std::span<const VideoCommon::BufferCopy> copies) {
++    static constexpr VkMemoryBarrier LANE_READ_BARRIER{
++        .sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER,
++        .pNext = nullptr,
++        .srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_MEMORY_WRITE_BIT,
++        .dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT | VK_ACCESS_TRANSFER_WRITE_BIT,
++    };
++    static constexpr VkMemoryBarrier LANE_HOST_BARRIER{
++        .sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER,
++        .pNext = nullptr,
++        .srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT,
++        .dstAccessMask = VK_ACCESS_HOST_READ_BIT | VK_ACCESS_MEMORY_READ_BIT,
++    };
++    boost::container::small_vector<VkBufferCopy, 8> vk_copies;
++    vk_copies.reserve(copies.size());
++    for (const VideoCommon::BufferCopy& copy : copies) {
++        vk_copies.push_back(VkBufferCopy{
++            .srcOffset = copy.src_offset,
++            .dstOffset = copy.dst_offset,
++            .size = copy.size,
++        });
++    }
++    cmdbuf.PipelineBarrier(VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_TRANSFER_BIT,
++                           VK_PIPELINE_STAGE_TRANSFER_BIT, 0, LANE_READ_BARRIER);
++    cmdbuf.CopyBuffer(src_buffer, dst_buffer, vk_copies);
++    cmdbuf.PipelineBarrier(VK_PIPELINE_STAGE_TRANSFER_BIT,
++                           VK_PIPELINE_STAGE_HOST_BIT | VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, 0,
++                           LANE_HOST_BARRIER);
++}
++
+ void BufferCacheRuntime::WaitSubmittedTick(u64 tick) {
+     auto& master = scheduler.GetMasterSemaphore();
+     if (master.IsFree(tick)) {
+diff --git a/src/video_core/renderer_vulkan/vk_buffer_cache.h b/src/video_core/renderer_vulkan/vk_buffer_cache.h
+index 0a1b8bb..4205a9b 100644
+--- a/src/video_core/renderer_vulkan/vk_buffer_cache.h
++++ b/src/video_core/renderer_vulkan/vk_buffer_cache.h
+@@ -127,6 +127,16 @@ public:
+ 
+     void Wait(u64 tick);
+ 
++    /// EDEN_NX2_ASYNC_DEP_QUEUE (vk_scheduler.h DependencyLane): copies recorded on the lane
++    /// complete at lane ticks, waited on the lane's timeline.
++    bool HasDependencyLane();
++    bool IsDependencyFree(u64 lane_tick);
++    void WaitDependency(u64 lane_tick);
++    /// Records the copy into `cmdbuf` now (the lane's command buffer), fenced for a compute
++    /// write before it and a host read after it.
++    void CopyBufferInto(vk::CommandBuffer cmdbuf, VkBuffer dst_buffer, VkBuffer src_buffer,
++                        std::span<const VideoCommon::BufferCopy> copies);
++
+     /// Waits for a submitted tick without flushing: safe on threads other than the GPU thread.
+     void WaitSubmittedTick(u64 tick);
+ 
+diff --git a/src/video_core/renderer_vulkan/vk_compute_pipeline.h b/src/video_core/renderer_vulkan/vk_compute_pipeline.h
+index df964ad..fcec075 100644
+--- a/src/video_core/renderer_vulkan/vk_compute_pipeline.h
++++ b/src/video_core/renderer_vulkan/vk_compute_pipeline.h
+@@ -61,6 +61,15 @@ public:
+                                  std::optional<ByteAddressedShadow>& shadow,
+                                  BindCommand* deferred_bind = nullptr);
+ 
++    /// EDEN_NX2_ASYNC_DEP_QUEUE: whether the deferred bind may run on the recording thread for
++    /// the dependency lane: the pipeline is built (no build wait recorded) and the bind commits
++    /// no descriptor set (push descriptors or descriptor buffer), which the worker thread may
++    /// be doing for an earlier dispatch of this pipeline from the same allocator.
++    [[nodiscard]] bool LaneBindable() const noexcept {
++        return is_built.load(std::memory_order_relaxed) &&
++               (uses_push_descriptor || uses_descriptor_buffer);
++    }
++
+     static constexpr u64 Ocarina1440pShader = 0x6bd913e1f34e83ebULL;
+     [[nodiscard]] bool CanReplaceOcarinaUpscale() const;
+ 
+diff --git a/src/video_core/renderer_vulkan/vk_master_semaphore.h b/src/video_core/renderer_vulkan/vk_master_semaphore.h
+index 064c893..34a57a6 100644
+--- a/src/video_core/renderer_vulkan/vk_master_semaphore.h
++++ b/src/video_core/renderer_vulkan/vk_master_semaphore.h
+@@ -38,9 +38,38 @@ public:
+         return gpu_tick.load(std::memory_order_acquire);
+     }
+ 
+-    /// Returns true when a tick has been hit by the GPU.
++    /// Returns true when a tick has been hit by the GPU. EDEN_NX2_ASYNC_DEP_QUEUE: main ticks
++    /// from `gated_tick` on also need the dependency lane past `gate_lane_tick` — resources
++    /// those ticks allocated (descriptor sets, descriptor buffer chunks, staging) are in use by
++    /// lane submissions (Scheduler::GateMainTick). Every pool recycles through here.
+     [[nodiscard]] bool IsFree(u64 tick) const noexcept {
+-        return KnownGpuTick() >= tick;
++        if (KnownGpuTick() < tick) {
++            return false;
++        }
++        return tick < gated_tick.load(std::memory_order_acquire) ||
++               lane_known_tick.load(std::memory_order_acquire) >=
++                   gate_lane_tick.load(std::memory_order_acquire);
++    }
++
++    /// Main ticks >= main_tick stay unfree until the lane reached lane_tick (recording thread).
++    void GateTick(u64 main_tick, u64 lane_tick) noexcept {
++        const u64 gated = gated_tick.load(std::memory_order_relaxed);
++        const bool previous_open = lane_known_tick.load(std::memory_order_acquire) >=
++                                   gate_lane_tick.load(std::memory_order_relaxed);
++        gated_tick.store(previous_open || main_tick < gated ? main_tick : gated,
++                         std::memory_order_release);
++        const u64 lane_gate = gate_lane_tick.load(std::memory_order_relaxed);
++        gate_lane_tick.store(lane_tick > lane_gate ? lane_tick : lane_gate,
++                             std::memory_order_release);
++    }
++
++    /// The lane's timeline reached lane_tick (any thread).
++    void SetLaneProgress(u64 lane_tick) noexcept {
++        u64 known = lane_known_tick.load(std::memory_order_relaxed);
++        while (known < lane_tick &&
++               !lane_known_tick.compare_exchange_weak(known, lane_tick, std::memory_order_release,
++                                                      std::memory_order_relaxed)) {
++        }
+     }
+ 
+     /// Advance to the logical tick and return the old one
+@@ -83,6 +112,9 @@ private:
+ private:
+     const Device& device;             ///< Device.
+     vk::Semaphore semaphore;          ///< Timeline semaphore.
++    std::atomic<u64> gated_tick{~u64{0}};  ///< GateTick: first main tick held by the lane
++    std::atomic<u64> gate_lane_tick{};     ///< GateTick: lane tick that opens the gate
++    std::atomic<u64> lane_known_tick{};    ///< SetLaneProgress
+     std::atomic<u64> gpu_tick{0};     ///< Current known GPU tick.
+     std::atomic<u64> current_tick{1}; ///< Current logical tick.
+     std::mutex wait_mutex;
+diff --git a/src/video_core/renderer_vulkan/vk_rasterizer.cpp b/src/video_core/renderer_vulkan/vk_rasterizer.cpp
+index 109c1b6..1454fd7 100644
+--- a/src/video_core/renderer_vulkan/vk_rasterizer.cpp
++++ b/src/video_core/renderer_vulkan/vk_rasterizer.cpp
+@@ -1767,9 +1767,13 @@ void RasterizerVulkan::DispatchCompute() {
+     constexpr bool can_replace = false;
+ #endif
+     ComputePipeline::BindCommand deferred_bind;
++    // EDEN_NX2_ASYNC_DEP_QUEUE: a dispatch that may go to the dependency lane gets its bind as a
++    // command (the DLSS path's mechanism): whether it is a producer is only known after Configure.
++    const bool lane_candidate =
++        scheduler.HasDependencyLane() && !indirect_address && pipeline->LaneBindable();
+     if (!pipeline->Configure(*kepler_compute, *gpu_memory, scheduler, buffer_cache,
+                              texture_cache, texture_cache_runtime, byte_addressed_shadow,
+-                             can_replace ? &deferred_bind : nullptr)) {
++                             (can_replace || lane_candidate) ? &deferred_bind : nullptr)) {
+         if (kepler_compute->IsNativeMode()) throw Shader::RuntimeError("Native compute resources unavailable");
+         return;
+     }
+@@ -1807,6 +1811,53 @@ void RasterizerVulkan::DispatchCompute() {
+     if (dependency_producer) {
+         Tegra::g_nx2_dep_producer_dispatches.fetch_add(1, std::memory_order_relaxed);
+     }
++    if (dependency_producer && lane_candidate && !can_replace && !byte_addressed_shadow &&
++        deferred_bind && pipeline->SampledImages().empty() && pipeline->WrittenImages().empty()) {
++        const auto& launch = kepler_compute->launch_description;
++        const std::array<u32, 3> lane_dim{launch.grid_dim_x, launch.grid_dim_y, launch.grid_dim_z};
++        const std::array<u32, 3> lane_max{device.GetMaxComputeWorkGroupCount()};
++        if (lane_dim[0] <= lane_max[0] && lane_dim[1] <= lane_max[1] && lane_dim[2] <= lane_max[2]) {
++            // EDEN_NX2_ASYNC_DEP_QUEUE: the dispatch runs on the dependency queue ahead of the
++            // graphics queue's backlog. Order of the next five statements is load-bearing:
++            // Configure put this dispatch's uploads and descriptor allocations in main tick T.
++            // (1) Gate T before anything could recycle it: its descriptor chunk/staging are what
++            //     the lane executes. (2) Flush T: inputs visible, and IsSubmitted(T) holds for the
++            //     lane's wait. (3) Record and submit on the lane waiting for T. (4) The main
++            //     stream waits for the lane only from T+1 (never T: cycle). Risks: a producer
++            //     whose inputs are images or written by draws of this same tick T is still right
++            //     (T is waited whole); one whose inputs were uploaded by a *later* dispatch is
++            //     impossible (uploads precede their dispatch).
++            const u64 main_tick = scheduler.CurrentTick();
++            scheduler.GateMainTick(main_tick, scheduler.NextDependencyTick());
++            scheduler.Flush();
++            const vk::CommandBuffer lane = scheduler.BeginDependencyCommands();
++            static constexpr VkMemoryBarrier LANE_READ_BARRIER{
++                .sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER,
++                .pNext = nullptr,
++                .srcAccessMask = VK_ACCESS_MEMORY_WRITE_BIT,
++                .dstAccessMask = VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_SHADER_READ_BIT,
++            };
++            static constexpr VkMemoryBarrier LANE_WRITE_BARRIER{
++                .sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER,
++                .pNext = nullptr,
++                .srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT,
++                .dstAccessMask = VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT,
++            };
++            lane.PipelineBarrier(VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,
++                                 VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, LANE_READ_BARRIER);
++            deferred_bind(lane);
++            lane.Dispatch(lane_dim[0], lane_dim[1], lane_dim[2]);
++            lane.PipelineBarrier(VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
++                                 VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, 0, LANE_WRITE_BARRIER);
++            // The page copies the front and the CPU reads go in the same command buffer, so
++            // they complete at this lane tick and nobody waits on the main queue for them.
++            buffer_cache.Nx2CopyListPagesInto(lane, scheduler.NextDependencyTick());
++            const u64 lane_tick = scheduler.SubmitDependencyCommands(main_tick);
++            scheduler.MainWaitsForDependency(lane_tick, scheduler.CurrentTick());
++            Tegra::g_nx2_dep_routed_dispatches.fetch_add(1, std::memory_order_relaxed);
++            return;
++        }
++    }
+     SCOPE_EXIT {
+         if (!frame_dump.Capturing()) {
+             return;
+@@ -1927,8 +1978,10 @@ void RasterizerVulkan::DispatchCompute() {
+             TextureCacheRuntime::CopyByteAddressedShadow(cmdbuf, *byte_addressed_shadow, true);
+         }
+     });
+-    if (can_replace) {
+-        // The deferred native binding may follow DLSS's command buffer bindings.
++    if (can_replace || lane_candidate) {
++        // The deferred native binding may follow DLSS's command buffer bindings; and a deferred
++        // bind skips UpdateDescriptorBufferChunk, so the scheduler's idea of the bound descriptor
++        // buffer is stale after it (EDEN_NX2_ASYNC_DEP_QUEUE candidates that were not routed).
+         scheduler.InvalidateState();
+     }
+     SubmitNx2ListCopies();
+diff --git a/src/video_core/renderer_vulkan/vk_resource_pool.cpp b/src/video_core/renderer_vulkan/vk_resource_pool.cpp
+index 92e66b7..b66f9d6 100644
+--- a/src/video_core/renderer_vulkan/vk_resource_pool.cpp
++++ b/src/video_core/renderer_vulkan/vk_resource_pool.cpp
+@@ -15,9 +15,13 @@ ResourcePool::ResourcePool(MasterSemaphore& master_semaphore_, size_t grow_step_
+     : master_semaphore{&master_semaphore_}, grow_step{grow_step_} {}
+ 
+ size_t ResourcePool::CommitResource() {
+-    const auto search = [this](size_t begin, size_t end, u64 gpu_tick) -> std::optional<size_t> {
++    // Through IsFree, not the raw GPU tick: with EDEN_NX2_ASYNC_DEP_QUEUE a main tick whose
++    // resources a dependency lane submission uses stays unfree until the lane is past it
++    // (MasterSemaphore::GateTick). Without a lane the two are the same comparison.
++    const auto search = [this](size_t begin, size_t end,
++                               [[maybe_unused]] u64 gpu_tick) -> std::optional<size_t> {
+         for (size_t iterator = begin; iterator < end; ++iterator) {
+-            if (gpu_tick >= ticks[iterator]) {
++            if (master_semaphore->IsFree(ticks[iterator])) {
+                 ticks[iterator] = master_semaphore->CurrentTick();
+                 return iterator;
+             }
+diff --git a/src/video_core/renderer_vulkan/vk_scheduler.cpp b/src/video_core/renderer_vulkan/vk_scheduler.cpp
+index 5367785..8228acc 100644
+--- a/src/video_core/renderer_vulkan/vk_scheduler.cpp
++++ b/src/video_core/renderer_vulkan/vk_scheduler.cpp
+@@ -296,9 +296,14 @@ u64 Scheduler::SubmitDependencyCommands(u64 wait_main_tick) {
+     return signal_value;
+ }
+ 
+-void Scheduler::MainWaitsForDependency(u64 lane_tick) {
++void Scheduler::MainWaitsForDependency(u64 lane_tick, u64 main_tick_from) {
+     DependencyLane& lane = *dependency_lane;
+     lane.pending_main_wait = (std::max)(lane.pending_main_wait, lane_tick);
++    lane.pending_main_wait_from = (std::max)(lane.pending_main_wait_from, main_tick_from);
++}
++
++void Scheduler::GateMainTick(u64 main_tick, u64 lane_tick) {
++    master_semaphore->GateTick(main_tick, lane_tick);
+ }
+ 
+ bool Scheduler::IsDependencyFree(u64 lane_tick) {
+@@ -308,6 +313,7 @@ bool Scheduler::IsDependencyFree(u64 lane_tick) {
+     }
+     const u64 value = lane.semaphore.GetCounter();
+     lane.known_gpu_tick.store(value, std::memory_order_release);
++    master_semaphore->SetLaneProgress(value);
+     return value >= lane_tick;
+ }
+ 
+@@ -316,10 +322,22 @@ void Scheduler::WaitDependency(u64 lane_tick) {
+         return;
+     }
+     DependencyLane& lane = *dependency_lane;
+-    lane.semaphore.Wait(lane_tick);
++    // EDEN_NX2_ASYNC_DEP_QUEUE: 2 s without the lane reaching the tick means a lane submission
++    // waiting on a main tick that itself waits on the lane (an ordering bug in the routing), or
++    // a lost device. Say so instead of hanging silently, stop routing new work
++    // (HasDependencyLane turns false) and keep waiting: the data is still needed.
++    while (!lane.semaphore.Wait(lane_tick, 2'000'000'000ULL)) {
++        LOG_CRITICAL(Render_Vulkan,
++                     "Dependency lane tick {} not reached in 2 s (lane counter {}, main tick {} "
++                     "known {}, {} submitted on the lane); routing disabled",
++                     lane_tick, lane.semaphore.GetCounter(), master_semaphore->CurrentTick(),
++                     master_semaphore->KnownGpuTick(), lane.tick);
++        lane.disabled.store(true, std::memory_order_relaxed);
++    }
+     lane.known_gpu_tick.store(
+         (std::max)(lane.known_gpu_tick.load(std::memory_order_relaxed), lane_tick),
+         std::memory_order_release);
++    master_semaphore->SetLaneProgress(lane_tick);
+ }
+ 
+ u64 Scheduler::Flush(VkSemaphore signal_semaphore, VkSemaphore wait_semaphore,
+@@ -942,9 +960,17 @@ u64 Scheduler::SubmitExecution(VkSemaphore signal_semaphore, VkSemaphore wait_se
+     InvalidateState();
+ 
+     const u64 signal_value = master_semaphore->NextTick();
+-    // The dependency lane's outputs this submission consumes (MainWaitsForDependency), if any.
+-    const u64 dep_wait_value =
+-        dependency_lane ? std::exchange(dependency_lane->pending_main_wait, u64{0}) : 0;
++    // The dependency lane's outputs this submission consumes (MainWaitsForDependency), if any:
++    // only from the tick the routing named, the earlier tick carries the lane's inputs.
++    u64 dep_wait_value = 0;
++    if (dependency_lane) {
++        master_semaphore->SetLaneProgress(dependency_lane->semaphore.GetCounter());
++        if (dependency_lane->pending_main_wait != 0 &&
++            signal_value >= dependency_lane->pending_main_wait_from) {
++            dep_wait_value = std::exchange(dependency_lane->pending_main_wait, u64{0});
++            dependency_lane->pending_main_wait_from = 0;
++        }
++    }
+     const VkSemaphore dep_wait_semaphore =
+         dep_wait_value != 0 ? *dependency_lane->semaphore : VK_NULL_HANDLE;
+     RecordWithUploadBuffer([signal_semaphore, wait_semaphore, signal_value, dep_wait_semaphore,
+diff --git a/src/video_core/renderer_vulkan/vk_scheduler.h b/src/video_core/renderer_vulkan/vk_scheduler.h
+index 02f6da5..3aefa69 100644
+--- a/src/video_core/renderer_vulkan/vk_scheduler.h
++++ b/src/video_core/renderer_vulkan/vk_scheduler.h
+@@ -315,8 +315,16 @@ public:
+     /// thread (the split's back) with its own command pool and timeline; its ticks are
+     /// independent of the main stream's. Absent when the switch is off or the device lacks it.
+     [[nodiscard]] bool HasDependencyLane() const noexcept {
+-        return dependency_lane != nullptr;
++        return dependency_lane != nullptr &&
++               !dependency_lane->disabled.load(std::memory_order_relaxed);
+     }
++    /// The lane tick the next SubmitDependencyCommands will signal.
++    [[nodiscard]] u64 NextDependencyTick() const noexcept {
++        return dependency_lane->tick + 1;
++    }
++    /// Main ticks from main_tick on are not recycled (MasterSemaphore::IsFree) until the lane
++    /// reached lane_tick: the resources they allocated are what the lane submission uses.
++    void GateMainTick(u64 main_tick, u64 lane_tick);
+     /// Begins the dependency command buffer of the next submission (one per submission) and
+     /// returns it: commands are recorded straight into it, on this thread, until the submit.
+     vk::CommandBuffer BeginDependencyCommands();
+@@ -324,9 +332,10 @@ public:
+     /// (0: no wait; it must be a submitted tick, IsSubmitted, or the two queues can wait on each
+     /// other), then signals the lane's timeline with the returned lane tick.
+     u64 SubmitDependencyCommands(u64 wait_main_tick);
+-    /// The next main submission waits for the lane's timeline to reach `lane_tick` before any of
+-    /// its commands: what consumes the lane's outputs is recorded after this call.
+-    void MainWaitsForDependency(u64 lane_tick);
++    /// The first main submission whose tick is >= main_tick_from waits for the lane's timeline to
++    /// reach `lane_tick` before any of its commands. Never the tick the lane itself waits for
++    /// (its inputs): that would be a cycle; the routing passes CurrentTick() after its Flush.
++    void MainWaitsForDependency(u64 lane_tick, u64 main_tick_from);
+     [[nodiscard]] bool IsDependencyFree(u64 lane_tick);
+     void WaitDependency(u64 lane_tick);
+ 
+@@ -485,7 +494,9 @@ private:
+         size_t next_buffer{};
+         vk::CommandBuffer current;
+         bool recording{};
+-        u64 pending_main_wait{}; ///< MainWaitsForDependency, taken by the next SubmitExecution
++        u64 pending_main_wait{};      ///< MainWaitsForDependency: lane tick to wait for
++        u64 pending_main_wait_from{}; ///< ... by the first submission with this tick or later
++        std::atomic<bool> disabled{}; ///< WaitDependency timed out: no more routing
+     };
+     std::unique_ptr<DependencyLane> dependency_lane;
+ 
