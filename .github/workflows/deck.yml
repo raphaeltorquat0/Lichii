@@ -1,14 +1,19 @@
 name: deck-build
 
 # Lichii for the Steam Deck: the same commit and PGO profile as each upstream release (build-N),
-# compiled for the Deck's CPU (Zen 2) and published here as release deck-N. Steps follow the
-# linux-x86_64-pgo job of zortos293/Lichii's release-binaries.yml.
+# compiled for the Deck's CPU (Zen 2), with the patches in deck/patches/ applied, and published
+# here as release deck-N. Steps follow the linux-x86_64-pgo job of zortos293/Lichii's
+# release-binaries.yml. A patch that no longer applies fails the build instead of being skipped.
 on:
   workflow_dispatch:
     inputs:
       tag:
         description: Upstream release to build (build-N). Empty means the newest.
         required: false
+      force:
+        description: Replace the deck-N release if it already exists
+        type: boolean
+        default: false
   schedule:
     - cron: "17 */6 * * *"
 
@@ -37,6 +42,7 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
           WANTED: ${{ inputs.tag }}
+          FORCE: ${{ inputs.force }}
         run: |
           set -euo pipefail
           tag="$WANTED"
@@ -46,7 +52,7 @@ jobs:
           fi
           [[ "$tag" =~ ^build-([0-9]+)$ ]] || { echo "not a build-N tag: $tag"; exit 1; }
           number="${BASH_REMATCH[1]}"
-          if gh release view "deck-$number" -R "$GITHUB_REPOSITORY" > /dev/null 2>&1; then
+          if [ "${FORCE:-false}" != "true" ] && gh release view "deck-$number" -R "$GITHUB_REPOSITORY" > /dev/null 2>&1; then
             echo "deck-$number already published"
             exit 0
           fi
@@ -71,6 +77,23 @@ jobs:
         with:
           repository: ${{ env.UPSTREAM }}
           ref: ${{ env.SHA }}
+
+      - name: Check out the Deck patches
+        uses: actions/checkout@v5
+        with:
+          path: fork
+          sparse-checkout: deck
+
+      - name: Apply the Deck patches
+        shell: bash
+        run: |
+          set -euo pipefail
+          for p in fork/deck/patches/*.patch; do
+            echo "applying $p"
+            git apply --check "$p"
+            git apply "$p"
+          done
+          ls fork/deck/patches/*.patch | xargs -n1 basename > applied-patches.txt
 
       - name: Install dependencies
         shell: bash
@@ -193,6 +216,11 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
+          if [ "${{ inputs.force }}" = "true" ]; then
+            gh release delete "deck-$NUMBER" -R "$GITHUB_REPOSITORY" -y --cleanup-tag || true
+          fi
+          notes="zortos293/Lichii build-$NUMBER (${SHA}) compiled with clang $PGO_LLVM_VERSION, the upstream eglantine.profdata PGO profile and -march=znver2 -mtune=znver2 for the Steam Deck's Zen 2 CPU."
+          notes="$notes"$'\n\n'"Patches (deck/patches/):"$'\n'"$(sed 's/^/- /' applied-patches.txt)"
           gh release create "deck-$NUMBER" "$ASSET" -R "$GITHUB_REPOSITORY" \
             --title "Lichii for Steam Deck, build $NUMBER (${SHA::7})" \
-            --notes "zortos293/Lichii build-$NUMBER (${SHA}) compiled with clang $PGO_LLVM_VERSION, the upstream eglantine.profdata PGO profile and -march=znver2 -mtune=znver2 for the Steam Deck's Zen 2 CPU."
+            --notes "$notes"
