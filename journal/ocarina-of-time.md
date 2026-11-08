@@ -101,6 +101,20 @@ O ganho foi de três vezes, mexendo só na decoração de ponto flutuante. Os 80
 
 Uma nota de método: nessa rodada o script de medição imprimiu 1,4 fps por um bug. Ele pegava o instante da última linha do log, que às vezes vem colada a outra linha escrita ao mesmo tempo. Corrigido para usar o instante da mesma linha do contador de quadros.
 
+### Segunda medição: occlusion queries e um trace novo
+
+O corte das occlusion queries por cima do `FAST_FP` (`EDEN_MAC_NO_OCCLUSION=1000`) deu 18,6 fps, com a GPU em 85%. Sem ele eram ~18,5. A acumulação de queries do MoltenVK não era gargalo, e a chave sai do código.
+
+O trace novo com `FAST_FP` mostra para onde foi o tempo de GPU:
+
+| Canal | Antes (ms/quadro) | Com `FAST_FP` (ms/quadro) |
+|---|---|---|
+| Fragment | ~120 | ~22 |
+| Compute | ~35 | ~16 |
+| Vertex | ~23 | ~8 |
+
+Restam ~47 ms de GPU espalhados por ~1.050 encoders por quadro: ~350 de render, ~350 de compute e o resto em cópias. A GPU fica em ~85%. Agora o custo não está concentrado num lugar só; ele está no volume de encoders.
+
 ### Próximos passos
 
 _Em andamento: identificar o shader de 58 ms e o limitador dele nos contadores da GPU, explicar os 195 render passes e corrigir, com cada mudança atrás de uma chave `EDEN_MAC_*` e medida no save._
