@@ -170,7 +170,7 @@ O patch: o SPIRV-Cross passa a guardar o `FunctionControl` no parser, e o `Compi
 
 O compilador do Metal aceitou o `noinline` e a imagem saiu correta. O spill dos maiores dispatches da rede caiu de 7.744 para 32 bytes por thread. Mesmo assim o quadro piorou: os encoders de compute passaram de ~350 para ~1.300 a 1.480 por quadro, com 41 a 54 ms de compute e ~35 ms de fragment.
 
-Inferência: o patch vale para toda função marcada `DontInline` no Lichii, não só para o HMMA, e o custo das chamadas engole o ganho do spill. O próximo teste é restringir o `noinline` ao HMMA.
+A primeira hipótese era que o patch atingia outras funções além do HMMA. Não é isso: o único `DontInline` que o Lichii emite é o do HMMA (`emit_spirv_tensor.cpp:264`). O custo vem das próprias 193 chamadas reais ao HMMA por kernel. Com o HMMA emulado em software no Metal, nem copiar a função inteira em cada uso nem chamá-la sai barato. O caminho que sobra para a rede é nativo: `simdgroup_matrix`.
 
 Uma armadilha de método: com o cache de pipelines quente, o MoltenVK reaproveita o MSL antigo e o patch não entra. É preciso medir com o cache frio.
 
