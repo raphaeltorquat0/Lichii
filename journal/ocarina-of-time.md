@@ -1,0 +1,79 @@
+# Ocarina of Time (Switch 2) no Steam Deck e no Mac: diário de otimização
+
+Diário em andamento. Cada etapa traz o que mudou, como foi medido e o número. Vira post quando terminar.
+
+## O ponto de partida
+
+O jogo é *The Legend of Zelda: Ocarina of Time* de Switch 2 (título `0400486024DEC000`), rodando no [Lichii](https://github.com/zortos293/Lichii), um fork do Eden com o backend nx2 para Switch 2. Este repositório é um fork do Lichii com builds para o Steam Deck: o workflow `deck-build` compila cada `build-N` do upstream com clang 23, PGO e `-march=znver2`, e aplica os patches de `deck/patches/`.
+
+Todas as medições foram feitas no mesmo lugar: o save na varanda da casa do Link, em Kokiri Forest, com 30 s parado e o Deck na tomada. O fps sai das linhas `present #` do log do Lichii. A cena é carregada sem ninguém tocar no aparelho, por um controle virtual (uinput) e uma fila de rodadas (`series.sh`) que roda sozinha no Deck como serviço do systemd.
+
+## Parte 1: Steam Deck LCD
+
+### Linha de base
+
+| Tela | fps | Observação |
+|---|---|---|
+| Menu de título | 9,8 | GPU 99% a 1600 MHz |
+| Jogo, imagem de fábrica | 10,2 a 11,6 | GPU 50 a 80% a 1040 MHz |
+
+### O que não mexeu no número
+
+Medido no mesmo ponto, com ruído de ±0,7 fps:
+
+- GPU fixa em 1600 MHz: 10,8 fps.
+- CPU em desempenho (EPP `performance`, piso em 3,5 GHz): 10,5 a 12,6 fps.
+- `gamemoderun`: 10,3 fps. No Deck ele nem troca o governor.
+- Threads da GPU presas em núcleos físicos separados: 11,8 fps.
+- Add-on "Dynamic FPS" desligado: 11,8 fps.
+- Thread única de GPU (`EDEN_NX2_SPLIT=0`): 10,7 fps.
+- Seis patches de sincronização entre as threads da GPU (sem drenar semáforos, sem esperar escritor, leitura por página, evento pelo syncpoint do guest, sem leitura reativa): 9,4 a 11,7 fps.
+
+### O diagnóstico
+
+Com a thread de GPU numa só, o perfil fecha a conta do quadro de ~93 ms:
+
+| Parte | ms por quadro |
+|---|---|
+| CPU da thread de GPU do emulador | 47,7 |
+| Espera pela GPU real (`Finish` e listas de comando geradas por compute) | 41,6 |
+| Lógica do jogo (guest) | ~0 (o jogo está sempre adiantado) |
+
+A GPU sozinha ocupa ~58 ms por quadro a 1040 MHz. Mesmo com CPU e GPU totalmente sobrepostas, o teto é ~17 fps. Trinta fps com a imagem de fábrica não cabem neste APU de 15 W. A comunidade chega ao mesmo teto: o melhor resultado público no Deck é 14 a 18 fps, com o anti-aliasing do jogo desligado.
+
+### O que o fork ganhou
+
+- **Patches por variável** em `deck/patches/` (até o 0024) e uma série portada para o HEAD do upstream em `deck/patches-head/`.
+- **`EDEN_NX2_ASTC_UNEVEN_RGBA8=0`**: as texturas ASTC de mips desalinhados passam a ser recomprimidas em BC1/BC3 em vez de ficar em RGBA8. Sem a chave, o carregamento do save estourava a memória e o earlyoom do SteamOS matava o Lichii em quase toda rodada. Com ela, as duas rodadas carregaram.
+- **Correções de vazamento** no `READ_COPY` e na marcação de páginas lidas pela CPU: cresciam gigabytes por minuto no menu.
+- **HEAD do upstream de 2026-11-08**: o menu foi a 30 fps (antes 9,8) e o boot caiu de ~7 min para ~2 min. No jogo, 9,3 a 9,6 fps.
+
+## Parte 2: Mac com M2 Pro
+
+O Lichii publica um build oficial para Apple Silicon e usa o MoltenVK (Vulkan sobre Metal).
+
+### Primeiro contato
+
+| Build | Menu | Jogo |
+|---|---|---|
+| Oficial build-117 | trava no vídeo de abertura (issue #237) | n/a |
+| Local, fonte do PR #768 (compilado neste Mac, 13,5 min) | 57 a 60 fps, imagem de fábrica | 2 a 6 fps |
+
+O menu roda 6 vezes mais rápido que no Deck. No jogo o Mac fica abaixo do Deck.
+
+### Primeiras pistas
+
+- O jogo usa task/mesh shaders, e o M2 Pro não tem `VK_EXT_mesh_shader` no MoltenVK, então o Lichii emula os draws de mesh. Desligar esses draws com o jogo aberto (`EDEN_NX2_NO_MESH_FILE`) não mudou o fps. Não é o gargalo.
+- Metal System Trace de 4 s: a GPU fica ocupada 96 a 97% do tempo, ~180 ms por quadro. Na mesma cena, a GPU do Deck, ~4 vezes mais fraca, gasta ~58 ms. Os maiores custos:
+  - um encoder de compute de ~58 ms, duas vezes por quadro;
+  - ~195 render passes por quadro a ~0,46 ms cada.
+- O bypass da rede de anti-aliasing (`oot_anti_aliasing=1`) não mudou nada: 6,0 fps. O compute de 58 ms é outra coisa.
+- Na CPU, o guest roda no Dynarmic e não no NCE, e o `sample` mostra o caminho lento de memória (`DynarmicCallbacks64::MemoryRead`, `ExclusiveMonitor::CheckAndClear`).
+
+### Meta
+
+40 a 50 fps no jogo, com a imagem de fábrica. A conta permite: a GPU do M2 Pro deveria fazer a cena em 15 a 20 ms, e os núcleos de CPU são ~2 vezes mais rápidos que os do Deck. Falta tirar o caminho Vulkan → MoltenVK → Metal da ineficiência de ~12 vezes e a CPU do caminho lento.
+
+### Próximos passos
+
+_Em andamento: identificar o shader de 58 ms e o limitador dele nos contadores da GPU, explicar os 195 render passes e corrigir, com cada mudança atrás de uma chave `EDEN_MAC_*` e medida no save._
