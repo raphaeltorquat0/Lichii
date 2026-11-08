@@ -115,6 +115,19 @@ O trace novo com `FAST_FP` mostra para onde foi o tempo de GPU:
 
 Restam ~47 ms de GPU espalhados por ~1.050 encoders por quadro: ~350 de render, ~350 de compute e o resto em cópias. A GPU fica em ~85%. Agora o custo não está concentrado num lugar só; ele está no volume de encoders.
 
+> **Correção:** todas as medições do Mac desde "Primeiro resultado" rodaram com o bypass da rede de anti-aliasing ligado (`oot_anti_aliasing=1`). Não são números com a imagem de fábrica. A medição com a rede ligada vem a seguir.
+
+### Terceira medição: argument buffers do Metal
+
+`MVK_CONFIG_USE_METAL_ARGUMENT_BUFFERS=0` faz o MoltenVK amarrar os recursos direto no encoder, sem argument buffers. Junto com o `FAST_FP` o jogo foi a **23,4 fps** (vi2: 43 a 46 ms por quadro), contra 18,5 só com o `FAST_FP`. A GPU caiu para 79%.
+
+Como diagnóstico, com os draws de mesh desligados (`EDEN_NX2_NO_MESH=1`, que deixa a imagem errada), o quadro fica em 42 ms. A emulação de mesh custa ~12 ms por quadro:
+
+- ~8 ms de compute: três dispatches pequenos com barreira em cada draw, ~66 draws por quadro;
+- o resto em ~120 render passes extras por quadro, de entrar e sair do pass para cada draw emulado.
+
+Na CPU, as threads do guest ficam 60 a 80% ocupadas, com ~10% em `ExclusiveMonitor::CheckAndClear` e ~10% em `swtch_pri` (yield). A thread de GPU fica em ~48%.
+
 ### Próximos passos
 
 _Em andamento: identificar o shader de 58 ms e o limitador dele nos contadores da GPU, explicar os 195 render passes e corrigir, com cada mudança atrás de uma chave `EDEN_MAC_*` e medida no save._
