@@ -189,6 +189,16 @@ O plano novo usa o MoltenVK que vem no `.app` (o fork do Ryujinx 1.4.1). Ele ace
 - **Fase 1:** `noinline` só no HMMA, só na rede.
 - **Fase 2:** o corpo do HMMA com `simdgroup_matrix` (quatro MACs 8x8x8 via scratch em threadgroup), com validação numérica.
 
+### Marco 2: kernels prontos
+
+- No MoltenVK, `EDEN_MAC_NATIVE_NET=<dir>` faz o `vk_pipeline_cache.cpp` procurar `<dir>/<FNV-1a 64 do SPIR-V>.metal`. Se o arquivo existe, o módulo é criado pelo caminho MSL direto (`0x19960412`), o workgroup size vai por `vkSetWorkgroupSizeMVK` e o ponto de entrada é `main0`. Sem arquivo, o SPIR-V segue normal, e os programas com tensor têm o hash registrado no log.
+- Um gerador (`make_msl.py`) parte do dump de MSL do MoltenVK e escreve os 11 kernels com HMMA em dois modos:
+  - `noinline`: a mesma matemática;
+  - `simdgroup`: quatro `simdgroup_multiply_accumulate` 8x8x8 em float, scratch de 2 KB por simdgroup em threadgroup e arredondamento para f16 depois de cada K=8, como o Lichii faz.
+- Sem o Metal Toolchain offline, a compilação dos kernels só é validada em tempo de execução, pelo MoltenVK.
+
+Rodadas previstas, as duas com imagem de fábrica e `FAST_FP`: NET-NOINL e NET-SG.
+
 ### Onde paramos no Mac
 
 | Mac, Kokiri | Sem correção | `EDEN_MAC_FAST_FP=1` |
