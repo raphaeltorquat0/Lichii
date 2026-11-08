@@ -14,6 +14,13 @@ on:
         description: Replace the deck-N release if it already exists
         type: boolean
         default: false
+      ref:
+        description: Build this upstream commit or branch instead of a release (published as deck-ref-<sha7>)
+        required: false
+      patches:
+        description: Apply deck/patches/ (off = pure upstream build, for A/B against our patches)
+        type: boolean
+        default: true
   schedule:
     - cron: "17 */6 * * *"
 
@@ -43,8 +50,21 @@ jobs:
           GH_TOKEN: ${{ github.token }}
           WANTED: ${{ inputs.tag }}
           FORCE: ${{ inputs.force }}
+          REF: ${{ inputs.ref }}
         run: |
           set -euo pipefail
+          if [ -n "$REF" ]; then
+            sha=$(gh api "repos/$UPSTREAM/commits/$REF" --jq .sha)
+            number="ref-${sha::7}"
+            if [ "${FORCE:-false}" != "true" ] && gh release view "deck-$number" -R "$GITHUB_REPOSITORY" > /dev/null 2>&1; then
+              echo "deck-$number already published"
+              exit 0
+            fi
+            echo "number=$number" >> "$GITHUB_OUTPUT"
+            echo "sha=$sha" >> "$GITHUB_OUTPUT"
+            echo "building $REF ($sha) as deck-$number"
+            exit 0
+          fi
           tag="$WANTED"
           if [ -z "$tag" ]; then
             tag=$(gh api "repos/$UPSTREAM/releases?per_page=30" \
@@ -86,8 +106,14 @@ jobs:
 
       - name: Apply the Deck patches
         shell: bash
+        env:
+          PATCHES: ${{ inputs.patches }}
         run: |
           set -euo pipefail
+          if [ "${PATCHES:-true}" = "false" ]; then
+            echo "(no patches: pure upstream build)" > applied-patches.txt
+            exit 0
+          fi
           for p in fork/deck/patches/*.patch; do
             echo "applying $p"
             git apply --check "$p"
@@ -219,7 +245,7 @@ jobs:
           if [ "${{ inputs.force }}" = "true" ]; then
             gh release delete "deck-$NUMBER" -R "$GITHUB_REPOSITORY" -y --cleanup-tag || true
           fi
-          notes="zortos293/Lichii build-$NUMBER (${SHA}) compiled with clang $PGO_LLVM_VERSION, the upstream eglantine.profdata PGO profile and -march=znver2 -mtune=znver2 for the Steam Deck's Zen 2 CPU."
+          notes="zortos293/Lichii $NUMBER (${SHA}) compiled with clang $PGO_LLVM_VERSION, the upstream eglantine.profdata PGO profile and -march=znver2 -mtune=znver2 for the Steam Deck's Zen 2 CPU."
           notes="$notes"$'\n\n'"Patches (deck/patches/):"$'\n'"$(sed 's/^/- /' applied-patches.txt)"
           gh release create "deck-$NUMBER" "$ASSET" -R "$GITHUB_REPOSITORY" \
             --title "Lichii for Steam Deck, build $NUMBER (${SHA::7})" \
