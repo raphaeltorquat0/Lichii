@@ -1,5 +1,5 @@
 --- a/src/video_core/engines/kepler_compute.cpp	2026-11-08 00:14:09
-+++ b/src/video_core/engines/kepler_compute.cpp	2026-11-08 00:14:09
++++ b/src/video_core/engines/kepler_compute.cpp	2026-11-08 00:14:47
 @@ -5,6 +5,8 @@
  // SPDX-License-Identifier: GPL-2.0-or-later
  
@@ -9,10 +9,11 @@
  #include <atomic>
  #include <bit>
  #include <bitset>
-@@ -911,6 +913,19 @@
+@@ -910,6 +912,20 @@
+     using namespace VideoCommon::OotNetwork;
      if (!BypassEnabled(program_id)) {
          return false;
-     }
++    }
 +    // Steam Deck build, diagnostic: each native compute program once, with its grid, to find the
 +    // network's passes at other resolutions (the keys below were taken at 1x with Max Resolution).
 +    {
@@ -21,11 +22,11 @@
 +        std::scoped_lock lock{seen_mutex};
 +        if (seen.insert(native_key).second) {
 +            LOG_INFO(HW_GPU, "Ocarina of Time: native compute program {:#x} grid {}x{}x{} block {}x{}x{}",
-+                     native_key, launch_description.grid_dim_x, launch_description.grid_dim_y,
-+                     launch_description.grid_dim_z, launch_description.block_dim_x,
-+                     launch_description.block_dim_y, launch_description.block_dim_z);
++                     native_key, launch_description.grid_dim_x.Value(),
++                     launch_description.grid_dim_y.Value(), launch_description.grid_dim_z.Value(),
++                     launch_description.block_dim_x.Value(), launch_description.block_dim_y.Value(),
++                     launch_description.block_dim_z.Value());
 +        }
-+    }
+     }
      auto* const state = rasterizer->OotNetworkBypass();
      if (!state) {
-         return false;
