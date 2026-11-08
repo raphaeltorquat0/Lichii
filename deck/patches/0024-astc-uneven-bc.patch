@@ -1,0 +1,39 @@
+diff --git a/dist/nx2_switches.txt b/dist/nx2_switches.txt
+index 063fafd..9ca5cd0 100644
+--- a/dist/nx2_switches.txt
++++ b/dist/nx2_switches.txt
+@@ -79,6 +79,13 @@ EDEN_NX2_FENCE_BATCH=1
+ # both figures every 600 frames ("Texture cache: device memory N MiB ..., M images K MiB").
+ #EDEN_NX2_TC_DRIVER_USAGE=0
+ 
++# =0: ASTC with uneven BC block mips (a level whose 4x4 block count is not level 0's shifted, e.g.
++# 768x768 with 10 levels) is re-compressed to BC1/BC3 like the rest instead of kept as RGBA8 on AMD
++# drivers (RADV included): 4-8x less memory per image. Kept as RGBA8 by default because the BC
++# copies showed dark seam lines on distant terrain in title 1 (RX 6600 XT, Windows).
++# The log line "ASTC WxHxL with N levels kept as RGBA8 (uneven BC block mips)" counts them.
++#EDEN_NX2_ASTC_UNEVEN_RGBA8=0
++
+ #EDEN_NX2_MME_JIT=0
+ #EDEN_NX2_PBFLUSH=0
+ #EDEN_NX2_SKIP_SAME=0
+diff --git a/src/video_core/renderer_vulkan/vk_texture_cache.cpp b/src/video_core/renderer_vulkan/vk_texture_cache.cpp
+index 0fb9b99..2fa4a2b 100644
+--- a/src/video_core/renderer_vulkan/vk_texture_cache.cpp
++++ b/src/video_core/renderer_vulkan/vk_texture_cache.cpp
+@@ -202,7 +202,15 @@ constexpr VkBorderColor ConvertBorderColor(const std::array<float, 4>& color) {
+ // an AMD driver, which samples those wrong: kept as the GPU decoder's RGBA8 instead, like huge
+ // arrays.
+ [[nodiscard]] bool IsUnevenMipRgba8Astc(const Device& device, const ImageInfo& info) {
+-    if (!IsPixelFormatASTC(info.format) || device.IsOptimalAstcSupported() ||
++    // EDEN_NX2_ASTC_UNEVEN_RGBA8=0: these images are re-compressed to BC1/BC3 like the others, 4x
++    // (BC3) or 8x (BC1) smaller than RGBA8, at the risk of the seam lines above. Ocarina of Time on
++    // the Steam Deck (RADV, 16 GB shared) keeps hundreds of 768x768 ones as RGBA8 (3 MiB each
++    // instead of 0.75) and its save load is killed by earlyoom.
++    static const bool keep_rgba8 = [] {
++        const char* value = std::getenv("EDEN_NX2_ASTC_UNEVEN_RGBA8");
++        return value == nullptr || value[0] != '0';
++    }();
++    if (!keep_rgba8 || !IsPixelFormatASTC(info.format) || device.IsOptimalAstcSupported() ||
+         info.type != ImageType::e2D || info.size.depth != 1 || info.resources.levels <= 1 ||
+         Settings::values.accelerate_astc.GetValue() != Settings::AstcDecodeMode::Gpu ||
+         Settings::GetAstcRecompression() == Settings::AstcRecompression::Uncompressed) {
