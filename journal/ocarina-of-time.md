@@ -161,6 +161,19 @@ Para o MoltenVK local, a primeira rodada de controle (fábrica + `FAST_FP`, Molt
 
 O patch: o SPIRV-Cross passa a guardar o `FunctionControl` no parser, e o `CompilerMSL` emite `static __attribute__((noinline))` quando a função tem `DontInline` e a opção está ligada (`MVK_CONFIG_SPIRV_HONOR_DONTINLINE=1`).
 
+### O SPIRV-Cross honrando `DontInline`: o spill some, o quadro piora
+
+| Mac, fábrica + `FAST_FP`, MoltenVK 1.4.2 local | fps | GPU |
+|---|---|---|
+| Sem o patch (FAC-MVKL) | 7,3 | 82% |
+| Com `MVK_CONFIG_SPIRV_HONOR_DONTINLINE=1` (FAC-NOINL) | 4,6 | 73% |
+
+O compilador do Metal aceitou o `noinline` e a imagem saiu correta. O spill dos maiores dispatches da rede caiu de 7.744 para 32 bytes por thread. Mesmo assim o quadro piorou: os encoders de compute passaram de ~350 para ~1.300 a 1.480 por quadro, com 41 a 54 ms de compute e ~35 ms de fragment.
+
+Inferência: o patch vale para toda função marcada `DontInline` no Lichii, não só para o HMMA, e o custo das chamadas engole o ganho do spill. O próximo teste é restringir o `noinline` ao HMMA.
+
+Uma armadilha de método: com o cache de pipelines quente, o MoltenVK reaproveita o MSL antigo e o patch não entra. É preciso medir com o cache frio.
+
 ### Onde paramos no Mac
 
 | Mac, Kokiri | Sem correção | `EDEN_MAC_FAST_FP=1` |
