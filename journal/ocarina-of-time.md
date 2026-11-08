@@ -128,6 +128,20 @@ Como diagnóstico, com os draws de mesh desligados (`EDEN_NX2_NO_MESH=1`, que de
 
 Na CPU, as threads do guest ficam 60 a 80% ocupadas, com ~10% em `ExclusiveMonitor::CheckAndClear` e ~10% em `swtch_pri` (yield). A thread de GPU fica em ~48%.
 
+> **Correção 2:** os 23,4 fps de `MVK_CONFIG_USE_METAL_ARGUMENT_BUFFERS=0` não valem. Sem argument buffers, 57 pipelines estouram o limite de 31 buffers por estágio do Metal e a imagem sai estourada. Era um quadro mais barato porque estava errado.
+
+### A imagem de fábrica
+
+Com a rede de anti-aliasing do jogo ligada (`oot_anti_aliasing=Game`) e `EDEN_MAC_FAST_FP=1`, o jogo fica em **9,6 fps** (vi2: ~104 ms por quadro), com a GPU em 92 a 93%. Repeti duas vezes e deu o mesmo número.
+
+Agora a rede domina o quadro: um único encoder de ~53 ms ("Dispatch & FillBuffer & Dispatch"). O compilador do Metal registra 7.744 bytes de spill de registradores por thread nesse encoder. A causa:
+
+- A rede usa matrizes em tensor cores, e o Lichii emula o HMMA em software com shuffles de subgrupo e `fma` (`emit_spirv_tensor.cpp:232` em diante).
+- O SPIRV-Cross marca a função de HMMA como `always_inline`. Ela é chamada 193 vezes num kernel de 957 KB de MSL, e a pressão de registradores estoura.
+- O M2 não expõe cooperative matrix pelo MoltenVK.
+
+Não é coisa de flag. A correção de verdade é um caminho nativo com `simdgroup_matrix` do Metal, ou um HMMA emitido com menos pressão de registradores (laço em vez de 193 cópias inline).
+
 ### Próximos passos
 
 _Em andamento: identificar o shader de 58 ms e o limitador dele nos contadores da GPU, explicar os 195 render passes e corrigir, com cada mudança atrás de uma chave `EDEN_MAC_*` e medida no save._
