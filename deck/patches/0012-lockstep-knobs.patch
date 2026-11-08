@@ -1,0 +1,46 @@
+--- a/src/video_core/dma_pusher.cpp
++++ b/src/video_core/dma_pusher.cpp
+@@ -198,7 +198,17 @@
+         // (the split only starts with unsafe reads; the settings can change mid-game).
+         const bool use_safe = !VideoCommon::GpuSplit::Get().Active() &&
+                               (Settings::IsDMALevelDefault() ? Settings::IsGPULevelHigh() : Settings::IsDMALevelSafe());
+-        if (!gpu_written && VideoCommon::GpuSplit::Get().Active() &&
++        // EDEN_NX2_WRITER_WAIT=0: entries on pages never marked GPU-written are parsed without
++        // waiting for the back to run the dispatches sent before them. Ocarina of Time waited
++        // here ~2,600 times a second (once per entry) to prove a negative: with the macro DMA
++        // drains and the acquire drains this kept the front in lock-step with the back, one
++        // draw at a time. Risk: the first dispatch that writes a page the CPU wrote lists on
++        // until then is seen one entry late, and that entry is parsed from stale words.
++        static const bool writer_wait = [] {
++            const char* value = std::getenv("EDEN_NX2_WRITER_WAIT");
++            return value == nullptr || value[0] != '0';
++        }();
++        if (!gpu_written && writer_wait && VideoCommon::GpuSplit::Get().Active() &&
+             VideoCommon::GpuSplit::Get().WaitForWriters()) {
+             gpu_written =
+                 IsGpuWrittenCommands(dma_state.dma_get, size_t{header.size} * sizeof(u32));
+--- a/src/video_core/engines/maxwell_3d.cpp
++++ b/src/video_core/engines/maxwell_3d.cpp
+@@ -1428,7 +1428,21 @@
+         memory_manager.ReadBlockUnsafe(source, diag_before.data(), read_bytes);
+     }
+     VideoCommon::Nx2Profile::CountDmaRead(macro);
+-    split.Drain(VideoCommon::DrainSite::MacroDmaRead);
++    // EDEN_NX2_MACRO_DMA_NODRAIN=1: read without waiting for the back; =2: wait only for the
++    // compute and copy methods sent so far (WaitForWriters), which cover the QMD release words
++    // the back writes itself. Ocarina of Time drained here ~6,800 times a second (~700 a frame),
++    // and 35 of 13,863 reads in a 2 s window saw words the drain changed (none on GPU-written
++    // pages): the rest of the drains only kept the front in lock-step with the back. The flushes
++    // below (buffer cache, pending query reports) still run on the back and wait for it.
++    static const char macro_dma_nodrain = [] {
++        const char* value = std::getenv("EDEN_NX2_MACRO_DMA_NODRAIN");
++        return value == nullptr ? '0' : value[0];
++    }();
++    if (macro_dma_nodrain == '2') {
++        split.WaitForWriters();
++    } else if (macro_dma_nodrain != '1') {
++        split.Drain(VideoCommon::DrainSite::MacroDmaRead);
++    }
+     if (VideoCommon::QueryDma::TraceEnabled()) {
+         split.Run(
+             [this, macro, method, source, read_bytes] {
