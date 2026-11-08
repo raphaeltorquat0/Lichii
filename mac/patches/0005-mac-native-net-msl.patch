@@ -1,0 +1,203 @@
+diff --git a/src/video_core/renderer_vulkan/vk_compute_pipeline.cpp b/src/video_core/renderer_vulkan/vk_compute_pipeline.cpp
+index a57ffb4..c59f2cd 100644
+--- a/src/video_core/renderer_vulkan/vk_compute_pipeline.cpp
++++ b/src/video_core/renderer_vulkan/vk_compute_pipeline.cpp
+@@ -208,8 +208,9 @@ ComputePipeline::ComputePipeline(const Device& device_, Scheduler& scheduler, vk
+                                  Common::ThreadWorker* thread_worker,
+                                  PipelineStatistics* pipeline_statistics,
+                                  VideoCore::ShaderNotify* shader_notify, const Shader::Info& info_,
+-                                 vk::ShaderModule spv_module_, u64 shader_hash_)
+-    : device{device_},
++                                 vk::ShaderModule spv_module_, u64 shader_hash_,
++                                 const char* entry_point_)
++    : device{device_}, entry_point{entry_point_},
+       pipeline_cache(pipeline_cache_), guest_descriptor_queue{guest_descriptor_queue_},
+       descriptor_buffer_ring{descriptor_buffer_ring_}, info{info_},
+       shader_hash{shader_hash_}, spv_module(std::move(spv_module_)) {
+@@ -287,7 +288,7 @@ ComputePipeline::ComputePipeline(const Device& device_, Scheduler& scheduler, vk
+                              : VkPipelineShaderStageCreateFlags{},
+                 .stage = VK_SHADER_STAGE_COMPUTE_BIT,
+                 .module = *spv_module,
+-                .pName = "main",
++                .pName = entry_point,
+                 .pSpecializationInfo = nullptr,
+             },
+             .layout = *pipeline_layout,
+diff --git a/src/video_core/renderer_vulkan/vk_compute_pipeline.h b/src/video_core/renderer_vulkan/vk_compute_pipeline.h
+index df964ad..0e89624 100644
+--- a/src/video_core/renderer_vulkan/vk_compute_pipeline.h
++++ b/src/video_core/renderer_vulkan/vk_compute_pipeline.h
+@@ -44,7 +44,8 @@ public:
+                              Common::ThreadWorker* thread_worker,
+                              PipelineStatistics* pipeline_statistics,
+                              VideoCore::ShaderNotify* shader_notify, const Shader::Info& info,
+-                             vk::ShaderModule spv_module, u64 shader_hash);
++                             vk::ShaderModule spv_module, u64 shader_hash,
++                             const char* entry_point = "main");
+ 
+     ComputePipeline& operator=(ComputePipeline&&) noexcept = delete;
+     ComputePipeline(ComputePipeline&&) noexcept = delete;
+@@ -101,6 +102,7 @@ private:
+     void RunBuild();
+ 
+     const Device& device;
++    const char* entry_point; ///< "main0" for Metal source (EDEN_MAC_NATIVE_NET)
+     vk::PipelineCache& pipeline_cache;
+     GuestDescriptorQueue& guest_descriptor_queue;
+     DescriptorBufferRing& descriptor_buffer_ring;
+diff --git a/src/video_core/renderer_vulkan/vk_pipeline_cache.cpp b/src/video_core/renderer_vulkan/vk_pipeline_cache.cpp
+index 0590dc4..2f55bfb 100644
+--- a/src/video_core/renderer_vulkan/vk_pipeline_cache.cpp
++++ b/src/video_core/renderer_vulkan/vk_pipeline_cache.cpp
+@@ -2086,7 +2086,25 @@ ComputePipelineCacheEntry PipelineCache::CreateComputePipeline(
+     }
+     const std::vector<u32> code{EmitSPIRV(profile, program)};
+     device.SaveShader(code);
+-    vk::ShaderModule spv_module{BuildShader(device, code)};
++    vk::ShaderModule spv_module;
++    const char* entry_point = "main";
++    {
++        bool uses_tensor{};
++        for (const auto* block : program.blocks) {
++            for (const auto& inst : block->Instructions()) {
++                uses_tensor |= inst.GetOpcode() == Shader::IR::Opcode::TensorMulAdd;
++            }
++        }
++        if (const auto msl = MacReplacementMsl(device, code, key.unique_hash, uses_tensor)) {
++            spv_module = BuildMslShader(device, *msl, program.workgroup_size);
++            if (spv_module) {
++                entry_point = "main0";
++            }
++        }
++    }
++    if (!spv_module) {
++        spv_module = BuildShader(device, code);
++    }
+ 
+     // Text log + .spv dump. Same split as the graphics path.
+     const bool should_log = GPU::Logging::IsActive();
+@@ -2112,7 +2130,7 @@ ComputePipelineCacheEntry PipelineCache::CreateComputePipeline(
+     return {.pipeline = std::make_unique<ComputePipeline>(
+                 device, scheduler, vulkan_pipeline_cache, descriptor_pool, guest_descriptor_queue,
+                 descriptor_buffer_ring, thread_worker, statistics, &shader_notify, program.info,
+-                std::move(spv_module), key.unique_hash),
++                std::move(spv_module), key.unique_hash, entry_point),
+             .null_pointer_slots = env.IsNativeProgram() ? env.NullStoragePointerSlots()
+                                                         : std::vector<std::pair<u32, u32>>{},
+             .mapped_pointers =
+diff --git a/src/video_core/renderer_vulkan/vk_shader_util.cpp b/src/video_core/renderer_vulkan/vk_shader_util.cpp
+index 7a0a2b1..6d5eca3 100644
+--- a/src/video_core/renderer_vulkan/vk_shader_util.cpp
++++ b/src/video_core/renderer_vulkan/vk_shader_util.cpp
+@@ -1,7 +1,19 @@
+ // SPDX-FileCopyrightText: Copyright 2018 yuzu Emulator Project
+ // SPDX-License-Identifier: GPL-2.0-or-later
+ 
++#include <cstdlib>
+ #include <cstring>
++#include <filesystem>
++#include <fstream>
++#include <sstream>
++#include <vector>
++#ifdef __APPLE__
++#include <dlfcn.h>
++#endif
++
++#include <fmt/format.h>
++
++#include "common/logging.h"
+ 
+ #include "common/common_types.h"
+ #include "video_core/renderer_vulkan/vk_shader_util.h"
+@@ -20,4 +32,62 @@ vk::ShaderModule BuildShader(const Device& device, std::span<const u32> code) {
+     });
+ }
+ 
++std::optional<std::string> MacReplacementMsl(const Device& device, std::span<const u32> code,
++                                             u64 shader_hash, bool uses_tensor) {
++#ifdef __APPLE__
++    static const char* const directory = std::getenv("EDEN_MAC_NATIVE_NET");
++    if (!directory || !device.IsMoltenVK()) {
++        return std::nullopt;
++    }
++    u64 fnv = 0xcbf29ce484222325ULL;
++    for (const std::byte byte : std::as_bytes(code)) {
++        fnv = (fnv ^ static_cast<u8>(byte)) * 0x100000001b3ULL;
++    }
++    const auto path = std::filesystem::path{directory} / fmt::format("{:016x}.metal", fnv);
++    std::ifstream file{path};
++    if (!file) {
++        if (uses_tensor) {
++            LOG_INFO(Render_Vulkan, "EDEN_MAC_NATIVE_NET: tensor shader {:016x} spirv {:016x} has no {}",
++                     shader_hash, fnv, path.string());
++        }
++        return std::nullopt;
++    }
++    std::stringstream text;
++    text << file.rdbuf();
++    LOG_INFO(Render_Vulkan, "EDEN_MAC_NATIVE_NET: shader {:016x} runs {}", shader_hash,
++             path.string());
++    return text.str();
++#else
++    return std::nullopt;
++#endif
++}
++
++vk::ShaderModule BuildMslShader(const Device& device, const std::string& msl,
++                                const std::array<u32, 3>& workgroup_size) {
++    // MoltenVK's MVKMSLSPIRVHeader: the MSL source magic number, then null-terminated source.
++    constexpr u32 MslSourceMagic = 0x19960412;
++    std::vector<u32> words(1 + (msl.size() + 1 + 3) / 4, 0);
++    words[0] = MslSourceMagic;
++    std::memcpy(words.data() + 1, msl.c_str(), msl.size() + 1);
++    vk::ShaderModule module = device.GetLogical().CreateShaderModule({
++        .sType = VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO,
++        .pNext = nullptr,
++        .flags = 0,
++        .codeSize = sizeof(u32) + msl.size() + 1,
++        .pCode = words.data(),
++    });
++#ifdef __APPLE__
++    // Direct MSL carries no workgroup size; MoltenVK takes it from its private API.
++    using SetWorkgroupSize = void (*)(VkShaderModule, u32, u32, u32);
++    static const auto set_workgroup_size =
++        reinterpret_cast<SetWorkgroupSize>(dlsym(RTLD_DEFAULT, "vkSetWorkgroupSizeMVK"));
++    if (!set_workgroup_size) {
++        LOG_ERROR(Render_Vulkan, "EDEN_MAC_NATIVE_NET: vkSetWorkgroupSizeMVK not found");
++        return vk::ShaderModule{};
++    }
++    set_workgroup_size(*module, workgroup_size[0], workgroup_size[1], workgroup_size[2]);
++#endif
++    return module;
++}
++
+ } // namespace Vulkan
+diff --git a/src/video_core/renderer_vulkan/vk_shader_util.h b/src/video_core/renderer_vulkan/vk_shader_util.h
+index 2f7c9f2..2446ea6 100644
+--- a/src/video_core/renderer_vulkan/vk_shader_util.h
++++ b/src/video_core/renderer_vulkan/vk_shader_util.h
+@@ -3,7 +3,10 @@
+ 
+ #pragma once
+ 
++#include <array>
++#include <optional>
+ #include <span>
++#include <string>
+ 
+ #include "common/common_types.h"
+ #include "video_core/vulkan_common/vulkan_wrapper.h"
+@@ -14,4 +17,13 @@ class Device;
+ 
+ vk::ShaderModule BuildShader(const Device& device, std::span<const u32> code);
+ 
++/// EDEN_MAC_NATIVE_NET=<dir> (MoltenVK only): the Metal source that replaces a compute program's
++/// SPIR-V, read from <dir>/<FNV-1a 64 of the SPIR-V>.metal. Its kernel is main0.
++std::optional<std::string> MacReplacementMsl(const Device& device, std::span<const u32> code,
++                                             u64 shader_hash, bool uses_tensor);
++
++/// A shader module from Metal source (MoltenVK's MSL source path) with its workgroup size.
++vk::ShaderModule BuildMslShader(const Device& device, const std::string& msl,
++                                const std::array<u32, 3>& workgroup_size);
++
+ } // namespace Vulkan

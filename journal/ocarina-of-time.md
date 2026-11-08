@@ -226,6 +226,14 @@ Com o MoltenVK que já vem no `.app`, os 10 programas com HMMA usados na cena fo
 
 Da imagem de fábrica sem correções até aqui, o ganho foi de 3,5 vezes.
 
+### Marco 4: `simdgroup_matrix`
+
+Com o HMMA nas unidades de matriz do M2 (NET-SG), o jogo fez 17,0 fps (~59 ms por quadro, GPU 86%), o mesmo que a versão `noinline` (17,2). O trace mostra a rede em ~6,7 ms por quadro, contra ~53 no começo, com spill de 0 a 32 B. A imagem ficou igual a olho, mas sem validação numérica dos buffers. Como não ganhou fps e a versão `noinline` tem matemática idêntica por construção, a `noinline` fica como padrão.
+
+Patch em `mac/patches/0005-mac-native-net-msl.patch`, com o gerador `0005-mac-native-net-make_msl.py`. Limitação: os `.metal` valem só para o SPIR-V exato desta build. Se o emissor muda, o hash muda; o Lichii volta ao SPIR-V, registra o hash novo no log, e os kernels precisam ser gerados de novo a partir de um dump novo.
+
+Com a imagem de fábrica o quadro (~59 ms) ficou perto do quadro com o bypass do anti-aliasing (~52 ms): a rede deixou de dominar. O que sobra é a emulação de mesh (~12 ms), ~1.000 encoders por quadro e a CPU.
+
 ### Onde paramos no Mac
 
 | Mac, Kokiri | Sem correção | `EDEN_MAC_FAST_FP=1` |
