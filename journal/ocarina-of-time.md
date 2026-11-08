@@ -254,6 +254,12 @@ A GPU só trabalha 66% do quadro, e nenhuma thread de CPU fica saturada. Os núc
 
 É o mesmo gargalo do Deck. O jogo lê da CPU, ~3,7 vezes por quadro, memória que a GPU acabou de escrever. Cada leitura faz um `FlushRegion` síncrono e esvazia a fila da GPU (`gpu.cpp:239-258`). O fork já tem trabalho para isso, feito para o Deck: o `READ_COPY` com tetos de memória, em que a leitura espera só o escritor dela e não a fila inteira. O próximo passo é portá-lo para o Mac.
 
+### Leituras reativas: teto de ~1 fps
+
+Diagnóstico com as armadilhas de leitura desligadas (`EDEN_NX2_NO_REACTIVE=1`, que pode deixar a imagem errada): 18,5 fps (53,6 ms por quadro, GPU 88%), contra 17,5. As leituras da CPU caíram para uma só em toda a rodada. O teto de eliminar as leituras reativas é ~1 fps, ~4 ms por quadro. Elas não são o maior item. O RSS subiu de 1.125 para 1.402 MiB.
+
+O `READ_COPY` com os tetos de memória já foi portado para o build do Mac e compilou; a medição vem a seguir. Depois dele, o alvo é o restante dos ~20 ms de GPU ociosa: a cadeia guest → frente → trás → MoltenVK, em que cada estágio fica em 50 a 60% e há pouca sobreposição entre quadros.
+
 ### Onde paramos no Mac
 
 | Mac, Kokiri | Sem correção | `EDEN_MAC_FAST_FP=1` |
