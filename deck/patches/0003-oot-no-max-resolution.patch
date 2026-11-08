@@ -1,0 +1,24 @@
+--- a/src/core/file_sys/patch_manager.cpp	2026-11-08 00:25:05
++++ b/src/core/file_sys/patch_manager.cpp	2026-11-08 00:25:05
+@@ -88,16 +88,12 @@
+     BuiltinPatchRecord{0x3C46200, DYNAMIC_FPS_ROUTINE, {}, true},
+ };
+ 
++// Steam Deck build: the Max Resolution patch is left out. It takes Ocarina of Time's "dynamic
++// resolution disabled" path, so the 3D renders at full scale; on the Deck the GPU-time controller
++// needs to drop to its 480p floor, which is what the game does on its own.
++[[maybe_unused]] constexpr auto& MAX_RESOLUTION_RECORDS_UNUSED = MAX_RESOLUTION_RECORDS;
++
+ constexpr std::array BUILTIN_PATCHES{
+-    // Ocarina of Time takes its "dynamic resolution disabled" path, so the 3D renders at full scale
+-    // instead of following the GPU-time controller down to its 480p floor.
+-    BuiltinPatch{
+-        .name = "Max Resolution (built-in)",
+-        .title_id = 0x0400486024DEC000,
+-        .module = "main",
+-        .build_id = "E0F3CCFAF50065AE4EA01EB5AEB13B1A45DA3348",
+-        .records = MAX_RESOLUTION_RECORDS,
+-    },
+     BuiltinPatch{
+         .name = "Dynamic FPS by Dark (built-in)",
+         .title_id = 0x0400486024DEC000,
