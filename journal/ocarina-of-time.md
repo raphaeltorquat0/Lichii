@@ -199,6 +199,21 @@ O plano novo usa o MoltenVK que vem no `.app` (o fork do Ryujinx 1.4.1). Ele ace
 
 Rodadas previstas, as duas com imagem de fábrica e `FAST_FP`: NET-NOINL e NET-SG.
 
+### Emulação de mesh em lote: menos passes, mesmo fps
+
+Com `EDEN_MAC_MESH_BATCH=1`, os dispatches da emulação de mesh rodam num lote antes do render pass, e o pass não fecha mais a cada draw de mesh. As mudanças:
+
+- **Prólogo do pass:** o lote entra no chunk logo antes do begin do pass, com uma barreira na entrada e outra na saída (`vk_scheduler.cpp:462`).
+- **Caminho antigo como reserva:** o draw cai no caminho que sai do pass quando o pass seria outro, quando um draw anterior do pass escreveu storage ou transform feedback, quando o draw amostra um render target do próprio pass, ou quando o pipeline ainda não compilou.
+- **Descriptor set por draw** (`vk_graphics_pipeline.cpp:856`): sem isso, dois draws do mesmo pipeline no mesmo lote se sobrescreveriam.
+
+| Mac, fábrica + `FAST_FP` | Render passes por quadro | Fins de pass causados pelo mesh | fps |
+|---|---|---|---|
+| Sem a chave (MESH0) | ~223 | ~48 | 9,2 / 9,6 |
+| Com a chave (MESH1) | ~181 | ~4 | 9,7 / 9,4 |
+
+A imagem saiu igual. O ganho estimado de ~2 ms fica abaixo do ruído enquanto a rede de anti-aliasing ocupa ~53 ms do quadro. O patch fica para quando a rede deixar de dominar. Ficou de fora: teste unitário do lote, porque o build não tem `YUZU_TESTS`.
+
 ### Onde paramos no Mac
 
 | Mac, Kokiri | Sem correção | `EDEN_MAC_FAST_FP=1` |
