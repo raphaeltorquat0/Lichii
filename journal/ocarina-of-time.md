@@ -142,6 +142,19 @@ Agora a rede domina o quadro: um único encoder de ~53 ms ("Dispatch & FillBuffe
 
 Não é coisa de flag. A correção de verdade é um caminho nativo com `simdgroup_matrix` do Metal, ou um HMMA emitido com menos pressão de registradores (laço em vez de 193 cópias inline).
 
+### Fábrica: antes e depois do `FAST_FP`
+
+| Mac, Kokiri, imagem de fábrica | fps | GPU |
+|---|---|---|
+| Sem correção (FAC0) | 4,9 | 96% |
+| `EDEN_MAC_FAST_FP=1` (FAC-FFP) | 9,6 | 92–93% |
+
+Com a imagem de fábrica o `FAST_FP` também dobra o fps.
+
+Tentativa descartada: um `simdgroup_barrier(mem_none)` no início de cada HMMA em software (`EDEN_MAC_HMMA_FENCE`), para o compilador não intercalar os shuffles dos HMMAs inlinados. Deu 9,3 fps e o spill subiu de 7.744 para 7.840 B/thread. Revertido.
+
+O Lichii já emite o HMMA como `OpFunction` com `DontInline`. Quem descarta essa marca é o SPIRV-Cross dentro do MoltenVK: ele gera `static inline __attribute__((always_inline))`. Próximo passo: compilar o MoltenVK localmente com o SPIRV-Cross honrando `DontInline`, e medir o spill e o fps.
+
 ### Próximos passos
 
 _Em andamento: identificar o shader de 58 ms e o limitador dele nos contadores da GPU, explicar os 195 render passes e corrigir, com cada mudança atrás de uma chave `EDEN_MAC_*` e medida no save._
