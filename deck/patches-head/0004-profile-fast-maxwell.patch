@@ -1,0 +1,82 @@
+diff --git a/src/video_core/engines/maxwell_3d.cpp b/src/video_core/engines/maxwell_3d.cpp
+index cb41fb1..2b77a81 100644
+--- a/src/video_core/engines/maxwell_3d.cpp
++++ b/src/video_core/engines/maxwell_3d.cpp
+@@ -55,8 +55,8 @@ Maxwell3D::Maxwell3D(MemoryManager& memory_manager_)
+     execution_mask.reset();
+     for (size_t i = 0; i < execution_mask.size(); i++)
+         execution_mask[i] = IsMethodExecutable(u32(i));
+-    fast_maxwell3d = !record_write_history &&
+-                     !trace_first_method_writes && !VideoCommon::Nx2Profile::Enabled();
++    fast_maxwell3d = !record_write_history && !trace_first_method_writes &&
++                     (!VideoCommon::Nx2Profile::Enabled() || VideoCommon::Nx2Profile::KeepFastPath());
+ }
+ 
+ Maxwell3D::~Maxwell3D() = default;
+diff --git a/src/video_core/gpu_split.cpp b/src/video_core/gpu_split.cpp
+index 54374d9..4c29560 100644
+--- a/src/video_core/gpu_split.cpp
++++ b/src/video_core/gpu_split.cpp
+@@ -320,8 +320,9 @@ size_t GpuSplit::Execute(const u64* entry, size_t words) {
+         const u32 argument = static_cast<u32>(head >> 32);
+         auto* const engine = back_engine;
+         if (engine->fast_maxwell3d) {
+-            // Nx2Perf: as below without the profile zones (off with fast_maxwell3d) and the
+-            // virtual call.
++            // Nx2Perf: as below without the virtual call. The zone is a no-op unless
++            // EDEN_NX2_GPU_PROFILE_FAST keeps this path under the profile (nx2_profile.h).
++            Nx2Profile::Scope method_scope{Nx2Profile::Zone::Method};
+             using Tegra::Engines::Maxwell3D;
+             auto* const maxwell3d = static_cast<Maxwell3D*>(engine);
+             constexpr u32 cb_data = MAXWELL3D_REG_INDEX(const_buffer.buffer);
+diff --git a/src/video_core/gpu_thread.cpp b/src/video_core/gpu_thread.cpp
+index ba05ee0..d7b4fdd 100644
+--- a/src/video_core/gpu_thread.cpp
++++ b/src/video_core/gpu_thread.cpp
+@@ -128,7 +128,10 @@ void ThreadManager::StartThread(VideoCore::RendererBase& renderer, Core::Fronten
+                     Profile::Scope scope{Profile::Zone::Push};
+                     scheduler.Push(system.GPU(), submit_list->channel, std::move(submit_list->entries));
+                 } else if (std::holds_alternative<GPUTickCommand>(next.data)) {
+-                    split.Defer([gpu = &system.GPU()] { gpu->TickWork(); });
++                    split.Defer([gpu = &system.GPU()] {
++                        Profile::Scope scope{Profile::Zone::Tick};
++                        gpu->TickWork();
++                    });
+                 } else if (auto* run = std::get_if<RunCommand>(&next.data)) {
+                     if (run->before_later_reads) {
+                         // GPU memory maps unmap caches (UnmapMemory downloads): the back's state.
+diff --git a/src/video_core/nx2_profile.h b/src/video_core/nx2_profile.h
+index 8d3c1e3..3400241 100644
+--- a/src/video_core/nx2_profile.h
++++ b/src/video_core/nx2_profile.h
+@@ -89,6 +89,16 @@ inline bool Enabled() {
+     return g_enabled;
+ }
+ 
++// EDEN_NX2_GPU_PROFILE_FAST=1: profile with Maxwell3D's fast method path kept (fast_maxwell3d),
++// the one a run without the profile takes. The back's "method" zone then times that path per
++// ring entry; the per-register counters ("3D register writes", "methods per second") only exist
++// on the slow path and read 0 for the back.
++inline const bool g_keep_fast_path = std::getenv("EDEN_NX2_GPU_PROFILE_FAST") != nullptr;
++
++inline bool KeepFastPath() {
++    return g_keep_fast_path;
++}
++
+ // Nanoseconds; from the host's own counter where the wall clock reads it directly (the zones
+ // run ~150,000 times a second, and QueryPerformanceCounter cost ~5% of the GPU thread).
+ inline u64 Now() {
+diff --git a/src/video_core/renderer_vulkan/vk_rasterizer.cpp b/src/video_core/renderer_vulkan/vk_rasterizer.cpp
+index df23e72..76b7d79 100644
+--- a/src/video_core/renderer_vulkan/vk_rasterizer.cpp
++++ b/src/video_core/renderer_vulkan/vk_rasterizer.cpp
+@@ -528,6 +528,9 @@ void RasterizerVulkan::PrepareDraw(bool is_indexed, Func&& draw_func, bool is_in
+     }
+ 
+     SCOPE_EXIT {
++        // Sync requests (CPU reads of GPU-written memory: FlushRegion, Scheduler::Finish) run
++        // here when the back is drawing: time them as "tick", not as part of the draw.
++        VideoCommon::Nx2Profile::Scope tick_scope{VideoCommon::Nx2Profile::Zone::Tick};
+         gpu.TickWork();
+     };
+     bool submitted = false;

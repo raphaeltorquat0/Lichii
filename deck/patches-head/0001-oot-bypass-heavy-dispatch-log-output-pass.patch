@@ -1,0 +1,131 @@
+diff --git a/src/video_core/engines/kepler_compute.cpp b/src/video_core/engines/kepler_compute.cpp
+index b499262..78a04d2 100644
+--- a/src/video_core/engines/kepler_compute.cpp
++++ b/src/video_core/engines/kepler_compute.cpp
+@@ -5,6 +5,8 @@
+ // SPDX-License-Identifier: GPL-2.0-or-later
+ 
+ #include <algorithm>
++#include <mutex>
++#include <set>
+ #include <atomic>
+ #include <bit>
+ #include <bitset>
+@@ -1055,6 +1057,20 @@ bool KeplerCompute::BypassOotNetwork(u64 program_id, u64 native_key) {
+     if (!BypassEnabled(program_id)) {
+         return false;
+     }
++    // Steam Deck build, diagnostic: each native compute program once, with its grid, to find the
++    // network's passes at other resolutions (the keys below were taken at 1x with Max Resolution).
++    {
++        static std::mutex seen_mutex;
++        static std::set<u64> seen;
++        std::scoped_lock lock{seen_mutex};
++        if (seen.insert(native_key).second) {
++            LOG_INFO(HW_GPU, "Ocarina of Time: native compute program {:#x} grid {}x{}x{} block {}x{}x{}",
++                     native_key, launch_description.grid_dim_x.Value(),
++                     launch_description.grid_dim_y.Value(), launch_description.grid_dim_z.Value(),
++                     launch_description.block_dim_x.Value(), launch_description.block_dim_y.Value(),
++                     launch_description.block_dim_z.Value());
++        }
++    }
+     auto* const bypass = rasterizer->OotNetworkBypass();
+     if (!bypass) {
+         return false;
+@@ -1070,20 +1086,43 @@ bool KeplerCompute::BypassOotNetwork(u64 program_id, u64 native_key) {
+     if (tonemapped.Address() == 0) {
+         return false;
+     }
+-    if (native_key == PrepassProgramKey || native_key == NetworkProgramKey) {
+-        return bypass->output_replaced.load(std::memory_order_relaxed);
+-    }
+-    if (native_key != OutputProgramKey) {
++    const bool replaced_before = bypass->output_replaced.load(std::memory_order_relaxed);
++    if (native_key == PrepassProgramKey) {
++        // Frame boundary of the network: the prepass comes first every frame.
++        bypass->after_network.store(false, std::memory_order_relaxed);
++        bypass->skip_budget.store(replaced_before ? 2 : 0, std::memory_order_relaxed);
++        return replaced_before;
++    }
++    if (native_key == NetworkProgramKey) {
++        bypass->after_network.store(true, std::memory_order_relaxed);
++        bypass->skip_budget.store(0, std::memory_order_relaxed);
++        return replaced_before;
++    }
++    if (native_key == HeavyDispatchProgramKey) {
++        return replaced_before;
++    }
++    if (!bypass->after_network.load(std::memory_order_relaxed)) {
++        // Between the prepass and the network (the heavy dispatch, whatever its key here).
++        const s32 budget = bypass->skip_budget.load(std::memory_order_relaxed);
++        if (replaced_before && budget > 0) {
++            bypass->skip_budget.store(budget - 1, std::memory_order_relaxed);
++            return true;
++        }
+         return false;
+     }
+-    // The copy needs the tonemapped image to be a B10G11R11 block-linear image of the output's size.
++    // After the network: the output pass is the first dispatch that writes a B10G11R11 block-linear
++    // image of the tonemapped image's size (handle at cb0+0xd0), whatever its program key.
+     const auto output = ConstBuffer0Image(OutputImageHandleOffset);
+     if (!output || output->format != Texture::TextureFormat::B10G11R11 || output->Address() == 0 ||
+         output->Address() == tonemapped.Address() || !output->IsBlockLinear() ||
+         tonemapped.format != Tegra::RenderTargetFormat::B10G11R11_FLOAT ||
+         tonemapped.tile_mode.is_pitch_linear || tonemapped.width != output->Width() ||
+         tonemapped.height != output->Height()) {
++        if (native_key != OutputProgramKey) {
++            return false;
++        }
+         bypass->output_replaced.store(false, std::memory_order_relaxed);
++        bypass->after_network.store(false, std::memory_order_relaxed);
+         static bool warned = false;
+         if (!std::exchange(warned, true)) {
+             LOG_WARNING(HW_GPU,
+@@ -1095,6 +1134,7 @@ bool KeplerCompute::BypassOotNetwork(u64 program_id, u64 native_key) {
+         }
+         return false;
+     }
++    bypass->after_network.store(false, std::memory_order_relaxed);
+     Fermi2D::Surface destination{};
+     destination.format = Tegra::RenderTargetFormat::B10G11R11_FLOAT;
+     destination.linear = Fermi2D::MemoryLayout::BlockLinear;
+@@ -1132,9 +1172,10 @@ bool KeplerCompute::BypassOotNetwork(u64 program_id, u64 native_key) {
+     static bool logged = false;
+     if (!std::exchange(logged, true)) {
+         LOG_INFO(HW_GPU,
+-                 "Ocarina of Time: anti-aliasing network bypassed ({}): {:#x} -> {:#x} {}x{}",
++                 "Ocarina of Time: anti-aliasing network bypassed ({}): {:#x} -> {:#x} {}x{} (output "
++                 "program {:#x})",
+                  copied ? "copy of the tonemapped image" : "copy failed", tonemapped.Address(),
+-                 output->Address(), width, height);
++                 output->Address(), width, height, native_key);
+     }
+     return copied;
+ }
+diff --git a/src/video_core/oot_network.h b/src/video_core/oot_network.h
+index a6dd82a..c654d92 100644
+--- a/src/video_core/oot_network.h
++++ b/src/video_core/oot_network.h
+@@ -25,6 +25,9 @@ constexpr u64 ProgramId = 0x0400486024DEC000ULL;
+ // Native program keys of the network's compute passes.
+ constexpr u64 PrepassProgramKey = 0x8475d671e6967428ULL;
+ constexpr u64 NetworkProgramKey = 0x42593194bb0b2b32ULL;
++// The heavy dispatch between the prepass and the network: its output feeds the network only, so
++// while the output pass is being replaced it is skipped too (Steam Deck build).
++constexpr u64 HeavyDispatchProgramKey = 0xd9ee412f00ce399aULL;
+ constexpr u64 OutputProgramKey = 0xda6df3e54c716df2ULL;
+ 
+ /// Constant buffer 0 offset of the output pass's texture handle for the B10G11R11 image it writes
+@@ -46,6 +49,12 @@ struct BypassState {
+     /// Render target 0 of the latest tonemap draw (address 0 until one is seen), under mutex.
+     Tegra::Engines::Maxwell3D::Regs::RenderTargetConfig tonemapped{};
+     std::atomic<bool> output_replaced{}; ///< the latest output pass was replaced
++    // Steam Deck build: at the game's dynamic resolutions the heavy dispatch and the output pass run
++    // as other native programs, so the output pass is recognised by what it writes (first dispatch
++    // after the network whose cb0 image is a B10G11R11 image of the tonemapped size) and the
++    // dispatches between the prepass and the network are skipped by position, at most `skip_budget`.
++    std::atomic<bool> after_network{};
++    std::atomic<s32> skip_budget{};
+ };
+ 
+ inline bool BypassEnabled(u64 program_id) {

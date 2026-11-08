@@ -1,0 +1,105 @@
+diff --git a/src/video_core/vulkan_common/vulkan_device.cpp b/src/video_core/vulkan_common/vulkan_device.cpp
+index 6fcd3a0..1ccabab 100644
+--- a/src/video_core/vulkan_common/vulkan_device.cpp
++++ b/src/video_core/vulkan_common/vulkan_device.cpp
+@@ -869,6 +869,18 @@ Device::~Device() {
+     vmaDestroyAllocator(allocator);
+ }
+ 
++VkDeviceSize Device::RenderTargetPoolBlockSize() {
++    static const VkDeviceSize size = [] {
++        const char* value = std::getenv("EDEN_NX2_RT_POOL");
++        if (value == nullptr) {
++            return VkDeviceSize{0};
++        }
++        const long mib = std::atol(value);
++        return VkDeviceSize{static_cast<u64>(mib >= 16 ? mib : 128)} << 20;
++    }();
++    return size;
++}
++
+ VmaPool Device::GetSeparatePool(SeparatePool kind, u32 memory_type) const {
+     std::scoped_lock lk{separate_pools_mutex};
+     VmaPool& pool = separate_pools[static_cast<u32>(kind)][memory_type];
+@@ -876,7 +888,8 @@ VmaPool Device::GetSeparatePool(SeparatePool kind, u32 memory_type) const {
+         const VmaPoolCreateInfo ci{
+             .memoryTypeIndex = memory_type,
+             .flags = 0,
+-            .blockSize = SeparatePoolBlockSize,
++            .blockSize = kind == SeparatePool::RenderTargets ? RenderTargetPoolBlockSize()
++                                                             : SeparatePoolBlockSize,
+             .minBlockCount = 0,
+             .maxBlockCount = 0,
+             .priority = 0.f,
+diff --git a/src/video_core/vulkan_common/vulkan_device.h b/src/video_core/vulkan_common/vulkan_device.h
+index 72d87fc..a2a2da9 100644
+--- a/src/video_core/vulkan_common/vulkan_device.h
++++ b/src/video_core/vulkan_common/vulkan_device.h
+@@ -279,7 +279,13 @@ public:
+     enum class SeparatePool : u32 {
+         SparsePages,
+         DeviceBuffers,
++        /// EDEN_NX2_RT_POOL: single-sample 2D render targets, in larger blocks (see
++        /// RenderTargetPoolBlockSize) that the driver keeps while targets come and go.
++        RenderTargets,
+     };
++    /// Block size of the RenderTargets pool: EDEN_NX2_RT_POOL's value in MiB (16 or more),
++    /// 128 MiB for any other value, 0 when the variable is unset (the pool is off).
++    static VkDeviceSize RenderTargetPoolBlockSize();
+     static constexpr VkDeviceSize SeparatePoolBlockSize = 16ULL << 20;
+ 
+     /// The pool of that kind for a memory type, created on first use (null if that failed).
+@@ -1290,7 +1296,7 @@ private:
+     VkInstance instance;         ///< Vulkan instance.
+     VmaAllocator allocator{};    ///< VMA allocator.
+     mutable std::mutex separate_pools_mutex;
+-    mutable std::array<std::array<VmaPool, VK_MAX_MEMORY_TYPES>, 2> separate_pools{};
++    mutable std::array<std::array<VmaPool, VK_MAX_MEMORY_TYPES>, 3> separate_pools{};
+     vk::DeviceDispatch dld;      ///< Device function pointers.
+     vk::PhysicalDevice physical; ///< Physical device.
+     vk::Device logical;          ///< Logical device.
+diff --git a/src/video_core/vulkan_common/vulkan_memory_allocator.cpp b/src/video_core/vulkan_common/vulkan_memory_allocator.cpp
+index 7fd03f4..0ad1d67 100644
+--- a/src/video_core/vulkan_common/vulkan_memory_allocator.cpp
++++ b/src/video_core/vulkan_common/vulkan_memory_allocator.cpp
+@@ -248,8 +248,38 @@ VkResult MemoryAllocator::AllocateImage(const VkImageCreateInfo &ci, bool dedica
+     // unbacked sparse fallback below.
+     const u64 texels = u64{ci.extent.width} * ci.extent.height * ci.extent.depth * ci.arrayLayers;
+     const bool huge = texels > (u64{1} << 28);
+-    VkResult result = huge ? VK_ERROR_OUT_OF_DEVICE_MEMORY
+-                           : vmaCreateImage(allocator, &ci, &alloc_ci, &handle, &allocation, &alloc_info);
++    // EDEN_NX2_RT_POOL: render targets go to a pool of their own with large blocks. Over half a
++    // default block (8 MiB: a 2560x1440 RGBA16F target is ~30 MB) an image otherwise gets memory
++    // of its own, which the driver allocates, maps, unmaps and frees each time the texture cache
++    // creates and collects it (Ocarina of Time recreates its post-processing targets about every
++    // frame while the camera moves: ~5% of the GPU back thread in the driver). Pool blocks stay.
++    bool pooled = false;
++    constexpr VkImageUsageFlags attachment_usage =
++        VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT;
++    if (!huge && !dedicated && Device::RenderTargetPoolBlockSize() != 0 &&
++        (ci.usage & attachment_usage) != 0 && ci.samples == VK_SAMPLE_COUNT_1_BIT &&
++        ci.imageType == VK_IMAGE_TYPE_2D && ci.mipLevels == 1 && ci.arrayLayers == 1) {
++        u32 memory_type{};
++        if (vmaFindMemoryTypeIndexForImageInfo(allocator, &ci, &alloc_ci, &memory_type) ==
++            VK_SUCCESS) {
++            if (const VmaPool pool =
++                    device.GetSeparatePool(Device::SeparatePool::RenderTargets, memory_type)) {
++                VmaAllocationCreateInfo pool_ci = alloc_ci;
++                pool_ci.pool = pool;
++                pooled = vmaCreateImage(allocator, &ci, &pool_ci, &handle, &allocation,
++                                        &alloc_info) == VK_SUCCESS;
++                static bool logged_pool{};
++                if (pooled && !logged_pool) {
++                    logged_pool = true;
++                    LOG_INFO(Render_Vulkan, "Render targets use their own pool ({} MiB blocks)",
++                             Device::RenderTargetPoolBlockSize() >> 20);
++                }
++            }
++        }
++    }
++    VkResult result = pooled ? VK_SUCCESS
++                      : huge ? VK_ERROR_OUT_OF_DEVICE_MEMORY
++                             : vmaCreateImage(allocator, &ci, &alloc_ci, &handle, &allocation, &alloc_info);
+     if (result == VK_ERROR_OUT_OF_DEVICE_MEMORY && !huge) {
+         // Over the device memory budget (Switch 2 titles fill 8 GB cards): let the driver page
+         // it out rather than failing the draw and aborting.

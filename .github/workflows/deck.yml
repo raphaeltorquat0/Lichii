@@ -55,11 +55,15 @@ jobs:
           WANTED: ${{ inputs.tag }}
           FORCE: ${{ inputs.force }}
           REF: ${{ inputs.ref }}
+          PATCHES: ${{ inputs.patches }}
+          PATCH_DIR: ${{ inputs.patch_dir }}
         run: |
           set -euo pipefail
           if [ -n "$REF" ]; then
             sha=$(gh api "repos/$UPSTREAM/commits/$REF" --jq .sha)
-            number="ref-${sha::7}"
+            # One release per (commit, patch series): deck-ref-<sha7>-pure, -deck, -head, ...
+            if [ "${PATCHES:-true}" = "false" ]; then suffix=pure; else suffix=$(basename "${PATCH_DIR:-deck/patches}" | sed 's/^patches-//; s/^patches$/deck/'); fi
+            number="ref-${sha::7}-$suffix"
             if [ "${FORCE:-false}" != "true" ] && gh release view "deck-$number" -R "$GITHUB_REPOSITORY" > /dev/null 2>&1; then
               echo "deck-$number already published"
               exit 0

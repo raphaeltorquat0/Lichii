@@ -1,0 +1,18 @@
+diff --git a/src/video_core/renderer_opengl/gl_buffer_cache.h b/src/video_core/renderer_opengl/gl_buffer_cache.h
+index 831ec09..a7a7963 100644
+--- a/src/video_core/renderer_opengl/gl_buffer_cache.h
++++ b/src/video_core/renderer_opengl/gl_buffer_cache.h
+@@ -94,6 +94,13 @@ public:
+     void PostCopyBarrier();
+     void Finish();
+ 
++    // OpenGL has no submission ticks: everything already ran, so nothing is ever pending.
++    [[nodiscard]] bool IsFree(u64) const noexcept {
++        return true;
++    }
++
++    void WaitSubmittedTick(u64) {}
++
+     void TickFrame(Common::SlotVector<Buffer>&) noexcept {}
+ 
+     void ClearBuffer(Buffer& dest_buffer, u32 offset, size_t size, u32 value);
