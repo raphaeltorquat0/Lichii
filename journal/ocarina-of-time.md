@@ -155,6 +155,17 @@ Tentativa descartada: um `simdgroup_barrier(mem_none)` no início de cada HMMA e
 
 O Lichii já emite o HMMA como `OpFunction` com `DontInline`. Quem descarta essa marca é o SPIRV-Cross dentro do MoltenVK: ele gera `static inline __attribute__((always_inline))`. Próximo passo: compilar o MoltenVK localmente com o SPIRV-Cross honrando `DontInline`, e medir o spill e o fps.
 
-### Próximos passos
+### Onde paramos no Mac
 
-_Em andamento: identificar o shader de 58 ms e o limitador dele nos contadores da GPU, explicar os 195 render passes e corrigir, com cada mudança atrás de uma chave `EDEN_MAC_*` e medida no save._
+| Mac, Kokiri | Sem correção | `EDEN_MAC_FAST_FP=1` |
+|---|---|---|
+| Imagem de fábrica | 4,9 fps | 9,6 fps (~104 ms) |
+| Bypass do anti-aliasing | 5,9 fps | 19,4 fps (~52 ms, GPU 88%) |
+
+A correção está em `mac/patches/0001-mac-fast-fp.patch`, e o relatório completo do perfil, com 11 rodadas, em [`mac-gpu-report.md`](mac-gpu-report.md). Uma ressalva para comparar com o Deck: o Deck roda em resolução 3/4, ou seja, com ~56% dos pixels do Mac.
+
+A meta de 40 a 50 fps com a imagem de fábrica ainda não foi atingida. O que falta, em ordem de ganho:
+
+1. **Tirar a rede de anti-aliasing do HMMA em software** (~53 ms por quadro). Ou um SPIRV-Cross que respeite o `DontInline`, compilado num MoltenVK local, ou um compute Metal próprio com `simdgroup_matrix` para os programas da rede.
+2. **Juntar os computes da emulação de mesh** num prólogo antes do render pass (até ~12 ms por quadro).
+3. **CPU do guest no Dynarmic**: não há NCE no macOS (`CMakeLists.txt:324`), e há ~10% em `ExclusiveMonitor::CheckAndClear`.
