@@ -234,6 +234,26 @@ Patch em `mac/patches/0005-mac-native-net-msl.patch`, com o gerador `0005-mac-na
 
 Com a imagem de fábrica o quadro (~59 ms) ficou perto do quadro com o bypass do anti-aliasing (~52 ms): a rede deixou de dominar. O que sobra é a emulação de mesh (~12 ms), ~1.000 encoders por quadro e a CPU.
 
+### As três correções juntas, e o gargalo novo
+
+As três correções juntas (`FAST_FP` + rede nativa `noinline` + `MESH_BATCH`) deram **17,5 fps** com a imagem de fábrica. O `MESH_BATCH` soma só +0,3 fps.
+
+O trace desse quadro de ~57 ms:
+
+| Trabalho de GPU | ms por quadro |
+|---|---|
+| Fragment (157 render passes) | 15,4 |
+| Dispatches (40) | 11,1 |
+| Rede de anti-aliasing | 7,0 |
+| Vertex | 5,7 |
+| Cópias (132 encoders) | 2,1 |
+| Occlusion | 0,5 |
+| **GPU ociosa** | **~20** |
+
+A GPU só trabalha 66% do quadro, e nenhuma thread de CPU fica saturada. Os núcleos do guest ficam em 54 a 64%, a thread da frente da GPU em ~51% e a de trás em ~54%. O quadro agora é limitado pela sincronização entre CPU e GPU, não pelo throughput.
+
+É o mesmo gargalo do Deck. O jogo lê da CPU, ~3,7 vezes por quadro, memória que a GPU acabou de escrever. Cada leitura faz um `FlushRegion` síncrono e esvazia a fila da GPU (`gpu.cpp:239-258`). O fork já tem trabalho para isso, feito para o Deck: o `READ_COPY` com tetos de memória, em que a leitura espera só o escritor dela e não a fila inteira. O próximo passo é portá-lo para o Mac.
+
 ### Onde paramos no Mac
 
 | Mac, Kokiri | Sem correção | `EDEN_MAC_FAST_FP=1` |
