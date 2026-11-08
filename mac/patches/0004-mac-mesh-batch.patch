@@ -1,326 +1,377 @@
-.../renderer_vulkan/vk_graphics_pipeline.cpp       | 79 +++++++++++++++-------
- .../renderer_vulkan/vk_graphics_pipeline.h         |  2 +-
- src/video_core/renderer_vulkan/vk_scheduler.cpp    | 65 ++++++++++++++++++
- src/video_core/renderer_vulkan/vk_scheduler.h      | 72 ++++++++++++++++++++
- 4 files changed, 191 insertions(+), 27 deletions(-)
-
---- Changes ---
-
-src/video_core/renderer_vulkan/vk_graphics_pipeline.cpp
-  @@ -797,6 +797,9 @@ bool GraphicsPipeline::ConfigureImpl(bool is_indexed) {
-  +        if (mesh_emulation) {
-  +            mesh_samples_render_target = texture_cache.SamplesRenderTarget(view_span);
-  +        }
-           if (scheduler.HasFragmentBarrier() &&
-               (scheduler.RenderPassHasStores() || texture_cache.SamplesRenderTarget(view_span))) {
-               scheduler.RequestOutsideRenderPassOperationContext();
-  @@ -848,19 +851,19 @@ bool GraphicsPipeline::ConfigureDraw(const RescalingPushConstant& rescaling,
-  +    // The descriptor set the mesh emulation's dispatch commits for the draw it feeds: one per
-  +    // draw, as batched dispatches (EDEN_MAC_MESH_BATCH) all run before their draws.
-  +    std::shared_ptr<VkDescriptorSet> mesh_descriptor_set;
-       if (mesh_emulation) {
-  +        mesh_descriptor_set = std::make_shared<VkDescriptorSet>(VK_NULL_HANDLE);
-           // The mesh program runs as a compute dispatch outside the render pass and writes the
-           // triangles the draw then reads; both use the descriptor set committed here.
-  -        scheduler.RequestOutsideRenderPassOperationContext();
-  -        if (!IsBuilt()) {
-  -            scheduler.Record([this](vk::CommandBuffer) { build->Wait(!worker_only_build); });
-  -        }
-  -        scheduler.Record([this, descriptor_data, groups = mesh_groups, capacity = mesh_capacity,
-  -                          task_buffers = mesh_task_buffers,
-  -                          rescaling_data = rescaling.Data(), is_rescaling = texture_cache.IsRescaling(),
-  -                          uses_render_area = render_area.uses_render_area,
-  -                          render_area_data = render_area.words](vk::CommandBuffer cmdbuf) {
-  -            mesh_descriptor_set = VK_NULL_HANDLE;
-  +        const auto make_dispatch = [&](bool batched) {
-  +            return [this, descriptor_data, groups = mesh_groups, capacity = mesh_capacity,
-  +                    task_buffers = mesh_task_buffers, mesh_descriptor_set, batched,
-  +                    rescaling_data = rescaling.Data(), is_rescaling = texture_cache.IsRescaling(),
-  +                    uses_render_area = render_area.uses_render_area,
-  +                    render_area_data = render_area.words](vk::CommandBuffer cmdbuf) {
-               const bool has_task{mesh_emulation->has_task};
-               if (!pipeline || !mesh_compute_pipeline || build->Failed() || groups == 0 ||
-                   (has_task && (!task_compute_pipeline || !distribution_pipeline))) {
-  @@ -869,7 +872,7 @@ bool GraphicsPipeline::ConfigureDraw(const RescalingPushConstant& rescaling,
-  -            mesh_descriptor_set = descriptor_set;
-  +            *mesh_descriptor_set = descriptor_set;
-               // The task and mesh programs read the draw's push constants and descriptors.
-               const auto bind_program_state = [&] {
-                   constexpr VkShaderStageFlags push_stages{VK_SHADER_STAGE_ALL_GRAPHICS |
-  @@ -901,18 +904,23 @@ bool GraphicsPipeline::ConfigureDraw(const RescalingPushConstant& rescaling,
-  -            // what the game's compute passes wrote (foliage instance lists, for one).
-  -            memory_barrier(VK_ACCESS_MEMORY_WRITE_BIT,
-  -                           VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT,
-  -                           vk::PIPELINE_STAGE_GRAPHICS_COMPUTE_TRANSFER,
-  -                           VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT);
-  +            // what the game's compute passes wrote (foliage instance lists, for one). Batched,
-  +            // the prologue's own barriers do this before and after all of its dispatches.
-  +            if (!batched) {
-  +                memory_barrier(VK_ACCESS_MEMORY_WRITE_BIT,
-  +                               VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT,
-  +                               vk::PIPELINE_STAGE_GRAPHICS_COMPUTE_TRANSFER,
-  +                               VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT);
-  +            }
-               if (!has_task) {
-                   cmdbuf.BindPipeline(VK_PIPELINE_BIND_POINT_COMPUTE, *mesh_compute_pipeline);
-                   bind_program_state();
-                   cmdbuf.Dispatch(groups, 1, 1);
-  -                memory_barrier(VK_ACCESS_SHADER_WRITE_BIT, VK_ACCESS_SHADER_READ_BIT,
-  -                               VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
-  -                               VK_PIPELINE_STAGE_VERTEX_SHADER_BIT);
-  +                if (!batched) {
-  +                    memory_barrier(VK_ACCESS_SHADER_WRITE_BIT, VK_ACCESS_SHADER_READ_BIT,
-  +                                   VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
-  +                                   VK_PIPELINE_STAGE_VERTEX_SHADER_BIT);
-  +                }
-                   return;
-               }
-               // 1. One task workgroup per draw group writes its payload (mesh workgroup count at
-  @@ -973,15 +981,33 @@ bool GraphicsPipeline::ConfigureDraw(const RescalingPushConstant& rescaling,
-  -            memory_barrier(VK_ACCESS_SHADER_WRITE_BIT, VK_ACCESS_SHADER_READ_BIT,
-  -                           VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
-  -                           VK_PIPELINE_STAGE_VERTEX_SHADER_BIT);
-  -        });
-  +            if (!batched) {
-  +                memory_barrier(VK_ACCESS_SHADER_WRITE_BIT, VK_ACCESS_SHADER_READ_BIT,
-  +                               VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
-  +                               VK_PIPELINE_STAGE_VERTEX_SHADER_BIT);
-  +            }
-  +            };
-  +        };
-  +        // EDEN_MAC_MESH_BATCH: in the active pass's prologue, unless the dispatch could read what
-  +        // the pass drew so far (its render targets, storage or transform feedback writes: the
-  +        // scheduler checks those) or must wait for its pipeline.
-  +        if (!IsBuilt() || mesh_samples_render_target ||
-  +            !scheduler.RecordInRenderPassPrologue(texture_cache.GetFramebuffer(),
-  +                                                  make_dispatch(true))) {
-  +            scheduler.RequestOutsideRenderPassOperationContext();
-  +            if (!IsBuilt()) {
-  +                scheduler.Record([this](vk::CommandBuffer) { build->Wait(!worker_only_build); });
-  +            }
-  +            scheduler.Record(make_dispatch(false));
-  +        }
-       }
-       scheduler.RequestRenderpass(texture_cache.GetFramebuffer());
-       if (writes_storage) {
-           scheduler.NoteRenderPassStores();
-       }
-  +    if (maxwell3d->regs.transform_feedback_enabled != 0) {
-  +        scheduler.NoteRenderPassWrites();
-  +    }
-       if (!IsBuilt()) {
-           // Wait for the pipeline to be built
-           scheduler.Record([this](vk::CommandBuffer) {
-  @@ -1022,7 +1048,8 @@ bool GraphicsPipeline::ConfigureDraw(const RescalingPushConstant& rescaling,
-  -                      render_area_data = render_area.words](vk::CommandBuffer cmdbuf) {
-  +                      render_area_data = render_area.words,
-  +                      mesh_descriptor_set](vk::CommandBuffer cmdbuf) {
-           if (bind_descriptor_buffer) {
-               const VkDescriptorBufferBindingInfoEXT binding_info{
-                   descriptor_buffer_ring.BindingInfo(descriptor_buffer_chunk)};
-  @@ -1059,9 +1086,9 @@ bool GraphicsPipeline::ConfigureDraw(const RescalingPushConstant& rescaling,
-  -            if (mesh_descriptor_set) {
-  +            if (*mesh_descriptor_set) {
-                   cmdbuf.BindDescriptorSets(VK_PIPELINE_BIND_POINT_GRAPHICS, *pipeline_layout, 0,
-  -                                          mesh_descriptor_set, nullptr);
-  +                                          *mesh_descriptor_set, nullptr);
-               }
-               return;
-           }
-  +53 -26
-
-src/video_core/renderer_vulkan/vk_graphics_pipeline.h
-  @@ -340,7 +340,7 @@ private:
-  -    VkDescriptorSet mesh_descriptor_set{}; ///< shared by the dispatch and the draw it feeds
-  +    bool mesh_samples_render_target{}; ///< this draw samples one of its render targets
-       VkBuffer mesh_output_buffer{};
-       VkDeviceSize mesh_output_offset{};
-       VkDeviceSize mesh_output_size{};
-  +1 -1
-
-src/video_core/renderer_vulkan/vk_scheduler.cpp
-  @@ -147,6 +147,14 @@ Scheduler::Scheduler(const Device& device_, StateTracker& state_tracker_)
-  +    // EDEN_MAC_MESH_BATCH=1 (MoltenVK): mesh emulation dispatches go in the pass's prologue
-  +    // instead of ending the pass (RecordInRenderPassPrologue); each Metal pass reloads and
-  +    // stores its tiles.
-  +    mesh_batch = device.IsMoltenVK() && std::getenv("EDEN_MAC_MESH_BATCH") != nullptr;
-  +    if (mesh_batch) {
-  +        LOG_INFO(Render_Vulkan, "EDEN_MAC_MESH_BATCH: mesh emulation dispatches batched before "
-  +                                "their render pass");
-  +    }
-       AcquireNewChunk();
-       AllocateWorkerCommandBuffer();
-       worker_thread = std::jthread([this](std::stop_token token) { WorkerThread(token); });
-  @@ -296,6 +304,8 @@ void Scheduler::DispatchWork() {
-  +        // The pass's begin may have gone with it: its prologue can no longer grow.
-  +        prologue_open = false;
-       }
-   }
-   
-  @@ -322,6 +332,11 @@ void Scheduler::BeginRenderPassImpl(const Framebuffer* framebuffer, VkRenderPass
-  +    // The prologue goes right before the begin (DispatchWork closes it if the begin lands in a
-  +    // new chunk).
-  +    prologue_last = chunk->Last();
-  +    prologue_open = mesh_batch;
-  +    prologue_used = false;
-       Record([renderpass, framebuffer_handle, render_area, values, clear_value_count,
-               after_compute](vk::CommandBuffer cmdbuf) {
-           const VkRenderPassBeginInfo renderpass_bi{
-  @@ -444,6 +459,55 @@ void Scheduler::RequestRenderpass(const Framebuffer* framebuffer, std::source_lo
-  +bool Scheduler::OpenRenderPassPrologue(const Framebuffer* framebuffer) {
-  +    // The same pass RequestRenderpass would keep.
-  +    if (!prologue_open || !state.renderpass || deferred_clear.framebuffer != nullptr ||
-  +        framebuffer->RenderPass() != state.renderpass ||
-  +        framebuffer->Handle() != state.framebuffer ||
-  +        framebuffer->RenderArea().width != state.render_area.width ||
-  +        framebuffer->RenderArea().height != state.render_area.height) {
-  +        return false;
-  +    }
-  +    if (prologue_used) {
-  +        return true;
-  +    }
-  +    // [earlier commands] [from_earlier] [prologue commands...] [into_pass] [begin]: one barrier
-  +    // orders what came before the pass (graphics, compute, copies) before the prologue's
-  +    // dispatches, one orders their writes before the pass's vertex and indirect reads.
-  +    auto into_pass = [](vk::CommandBuffer cmdbuf, vk::CommandBuffer) {
-  +        const VkMemoryBarrier barrier{
-  +            .sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER,
-  +            .pNext = nullptr,
-  +            .srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT,
-  +            .dstAccessMask = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_INDIRECT_COMMAND_READ_BIT,
-  +        };
-  +        cmdbuf.PipelineBarrier(VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
-  +                               VK_PIPELINE_STAGE_VERTEX_SHADER_BIT |
-  +                                   VK_PIPELINE_STAGE_DRAW_INDIRECT_BIT,
-  +                               0, barrier);
-  +    };
-  +    auto from_earlier = [](vk::CommandBuffer cmdbuf, vk::CommandBuffer) {
-  +        const VkMemoryBarrier barrier{
-  +            .sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER,
-  +            .pNext = nullptr,
-  +            .srcAccessMask = VK_ACCESS_MEMORY_WRITE_BIT,
-  +            .dstAccessMask = VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT,
-  +        };
-  +        cmdbuf.PipelineBarrier(vk::PIPELINE_STAGE_GRAPHICS_COMPUTE_TRANSFER,
-  +                               VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, barrier);
-  +    };
-  +    // into_pass alone (from_earlier did not fit) is a harmless extra barrier.
-  +    Command* lead{};
-  +    if (!chunk->RecordAfter(prologue_last, into_pass) ||
-  +        !(lead = chunk->RecordAfter(prologue_last, from_earlier))) {
-  +        prologue_open = false;
-  +        return false;
-  +    }
-  +    prologue_last = lead;
-  +    prologue_used = true;
-  +    return true;
-  +}
-  +
-   void Scheduler::RequestOutsideRenderPassOperationContext(std::source_location location) {
-       if (state.renderpass) {
-           CountRenderPassEnd(location.file_name(), location.line());
-  @@ -877,6 +941,7 @@ void Scheduler::EndRenderPass()
-  +        prologue_open = false;
-   
-           query_cache->CounterClose(VideoCommon::QueryType::StreamingByteCount);
-   
-  +65 -0
-
-src/video_core/renderer_vulkan/vk_scheduler.h
-  @@ -129,12 +129,28 @@ public:
-  +        prologue_open = false;
-       }
-   
-       bool RenderPassHasStores() const {
-           return render_pass_has_stores;
-       }
-   
-  +    /// A draw in the active pass wrote memory a later command may read (transform feedback).
-  +    void NoteRenderPassWrites() {
-  +        prologue_open = false;
-  +    }
-  +
-  +    /// EDEN_MAC_MESH_BATCH=1 (MoltenVK): records `c`, which must be valid outside a render pass,
-  +    /// in the active pass's prologue: just before the pass began, after the other prologue
-  +    /// commands, between one barrier from earlier work and one into the pass's vertex/indirect
-  +    /// reads. The pass then keeps going instead of ending for `c`. False, recording nothing, when
-  +    /// `framebuffer` would not keep the active pass, the pass's begin already went to the worker,
-  +    /// or a draw in the pass wrote storage or transform feedback: `c` could read those writes.
-  +    template <typename T>
-  +        requires std::is_invocable_v<T, vk::CommandBuffer>
-  +    bool RecordInRenderPassPrologue(const Framebuffer* framebuffer, T&& c);
-  +
-       /// A dispatch was recorded: the next render pass must see what it wrote.
-       void NoteComputeWrites() {
-           compute_writes_pending = true;
-  @@ -375,6 +391,36 @@ private:
-  +        /// Like Record, but links the command right after `after` (first when null), which must
-  +        /// be a command of this chunk. Returns the command, or null when the chunk is full.
-  +        template <typename T>
-  +        Command* RecordAfter(Command* after, T& command) {
-  +            using FuncType = TypedCommand<T>;
-  +            static_assert(sizeof(FuncType) < sizeof(data), "Lambda is too large");
-  +
-  +            const size_t offset = Common::AlignUp(command_offset, alignof(FuncType));
-  +            if (offset > sizeof(data) - sizeof(FuncType)) {
-  +                return nullptr;
-  +            }
-  +            Command* const inserted = new (data.data() + offset) FuncType(std::move(command));
-  +            command_offset = offset + sizeof(FuncType);
-  +            if (after) {
-  +                inserted->SetNext(after->GetNext());
-  +                after->SetNext(inserted);
-  +            } else {
-  +                inserted->SetNext(first);
-  +                first = inserted;
-  +            }
-  +            if (after == last) {
-  +                last = inserted;
-  +            }
-  +            return inserted;
-  +        }
-  +
-  +        Command* Last() const {
-  +            return last;
-  +        }
-  +
-           void MarkSubmit() {
-               submit = true;
-           }
-  @@ -440,6 +486,9 @@ private:
-  +    /// RecordInRenderPassPrologue's checks; puts the prologue's two barriers in on first use.
-  +    bool OpenRenderPassPrologue(const Framebuffer* framebuffer);
-  +
-       void AcquireNewChunk();
-   
-       const Device& device;
-  @@ -448,6 +497,13 @@ private:
-  +    // EDEN_MAC_MESH_BATCH: the active pass's prologue (RecordInRenderPassPrologue). Commands go
-  +    // after `prologue_last` (the chunk's front when null) while `prologue_open`; `prologue_used`
-  +    // once its barriers are in.
-  +    bool mesh_batch{};
-  +    bool prologue_open{};
-  +    bool prologue_used{};
-  +    Command* prologue_last{};
-       bool compute_writes_pending{};
-       bool graphics_pipeline_missing{};
-       std::unique_ptr<CommandPool> command_pool;
-  @@ -524,4 +580,20 @@ private:
-  +template <typename T>
-  +    requires std::is_invocable_v<T, vk::CommandBuffer>
-  +bool Scheduler::RecordInRenderPassPrologue(const Framebuffer* framebuffer, T&& c) {
-  +    if (!OpenRenderPassPrologue(framebuffer)) {
-  +        return false;
-  +    }
-  +    auto command = [c = std::move(c)](vk::CommandBuffer cmdbuf, vk::CommandBuffer) { c(cmdbuf); };
-  +    Command* const inserted = chunk->RecordAfter(prologue_last, command);
-  +    if (!inserted) {
-  +        prologue_open = false;
-  +        return false;
-  +    }
-  +    prologue_last = inserted;
-  +    return true;
-  +}
-  +
-   } // namespace Vulkan
-  +72 -0
+diff --git a/src/video_core/renderer_vulkan/vk_graphics_pipeline.cpp b/src/video_core/renderer_vulkan/vk_graphics_pipeline.cpp
+index 0cb6e61..0d81bbc 100644
+--- a/src/video_core/renderer_vulkan/vk_graphics_pipeline.cpp
++++ b/src/video_core/renderer_vulkan/vk_graphics_pipeline.cpp
+@@ -797,6 +797,9 @@ bool GraphicsPipeline::ConfigureImpl(bool is_indexed) {
+         texture_cache.UpdateRenderTargets(false);
+         const std::span<const VideoCommon::ImageViewInOut> view_span{views.data(), views.size()};
+         texture_cache.CheckFeedbackLoop(view_span);
++        if (mesh_emulation) {
++            mesh_samples_render_target = texture_cache.SamplesRenderTarget(view_span);
++        }
+         if (scheduler.HasFragmentBarrier() &&
+             (scheduler.RenderPassHasStores() || texture_cache.SamplesRenderTarget(view_span))) {
+             scheduler.RequestOutsideRenderPassOperationContext();
+@@ -848,19 +851,19 @@ bool GraphicsPipeline::ConfigureDraw(const RescalingPushConstant& rescaling,
+         }
+     }
+ 
++    // The descriptor set the mesh emulation's dispatch commits for the draw it feeds: one per
++    // draw, as batched dispatches (EDEN_MAC_MESH_BATCH) all run before their draws.
++    std::shared_ptr<VkDescriptorSet> mesh_descriptor_set;
+     if (mesh_emulation) {
++        mesh_descriptor_set = std::make_shared<VkDescriptorSet>(VK_NULL_HANDLE);
+         // The mesh program runs as a compute dispatch outside the render pass and writes the
+         // triangles the draw then reads; both use the descriptor set committed here.
+-        scheduler.RequestOutsideRenderPassOperationContext();
+-        if (!IsBuilt()) {
+-            scheduler.Record([this](vk::CommandBuffer) { build->Wait(!worker_only_build); });
+-        }
+-        scheduler.Record([this, descriptor_data, groups = mesh_groups, capacity = mesh_capacity,
+-                          task_buffers = mesh_task_buffers,
+-                          rescaling_data = rescaling.Data(), is_rescaling = texture_cache.IsRescaling(),
+-                          uses_render_area = render_area.uses_render_area,
+-                          render_area_data = render_area.words](vk::CommandBuffer cmdbuf) {
+-            mesh_descriptor_set = VK_NULL_HANDLE;
++        const auto make_dispatch = [&](bool batched) {
++            return [this, descriptor_data, groups = mesh_groups, capacity = mesh_capacity,
++                    task_buffers = mesh_task_buffers, mesh_descriptor_set, batched,
++                    rescaling_data = rescaling.Data(), is_rescaling = texture_cache.IsRescaling(),
++                    uses_render_area = render_area.uses_render_area,
++                    render_area_data = render_area.words](vk::CommandBuffer cmdbuf) {
+             const bool has_task{mesh_emulation->has_task};
+             if (!pipeline || !mesh_compute_pipeline || build->Failed() || groups == 0 ||
+                 (has_task && (!task_compute_pipeline || !distribution_pipeline))) {
+@@ -869,7 +872,7 @@ bool GraphicsPipeline::ConfigureDraw(const RescalingPushConstant& rescaling,
+             const VkDescriptorSet descriptor_set{descriptor_allocator.Commit()};
+             device.GetLogical().UpdateDescriptorSet(descriptor_set, *descriptor_update_template,
+                                                     descriptor_data);
+-            mesh_descriptor_set = descriptor_set;
++            *mesh_descriptor_set = descriptor_set;
+             // The task and mesh programs read the draw's push constants and descriptors.
+             const auto bind_program_state = [&] {
+                 constexpr VkShaderStageFlags push_stages{VK_SHADER_STAGE_ALL_GRAPHICS |
+@@ -901,18 +904,23 @@ bool GraphicsPipeline::ConfigureDraw(const RescalingPushConstant& rescaling,
+             };
+             // The scheduler orders earlier compute writes only before the next render pass
+             // (COMPUTE -> ALL_GRAPHICS); these dispatches run before it, and the programs read
+-            // what the game's compute passes wrote (foliage instance lists, for one).
+-            memory_barrier(VK_ACCESS_MEMORY_WRITE_BIT,
+-                           VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT,
+-                           vk::PIPELINE_STAGE_GRAPHICS_COMPUTE_TRANSFER,
+-                           VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT);
++            // what the game's compute passes wrote (foliage instance lists, for one). Batched,
++            // the prologue's own barriers do this before and after all of its dispatches.
++            if (!batched) {
++                memory_barrier(VK_ACCESS_MEMORY_WRITE_BIT,
++                               VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT,
++                               vk::PIPELINE_STAGE_GRAPHICS_COMPUTE_TRANSFER,
++                               VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT);
++            }
+             if (!has_task) {
+                 cmdbuf.BindPipeline(VK_PIPELINE_BIND_POINT_COMPUTE, *mesh_compute_pipeline);
+                 bind_program_state();
+                 cmdbuf.Dispatch(groups, 1, 1);
+-                memory_barrier(VK_ACCESS_SHADER_WRITE_BIT, VK_ACCESS_SHADER_READ_BIT,
+-                               VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+-                               VK_PIPELINE_STAGE_VERTEX_SHADER_BIT);
++                if (!batched) {
++                    memory_barrier(VK_ACCESS_SHADER_WRITE_BIT, VK_ACCESS_SHADER_READ_BIT,
++                                   VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
++                                   VK_PIPELINE_STAGE_VERTEX_SHADER_BIT);
++                }
+                 return;
+             }
+             // 1. One task workgroup per draw group writes its payload (mesh workgroup count at
+@@ -973,15 +981,33 @@ bool GraphicsPipeline::ConfigureDraw(const RescalingPushConstant& rescaling,
+             cmdbuf.BindPipeline(VK_PIPELINE_BIND_POINT_COMPUTE, *mesh_compute_pipeline);
+             bind_program_state();
+             cmdbuf.DispatchIndirect(task_buffers[2].buffer, task_buffers[2].offset);
+-            memory_barrier(VK_ACCESS_SHADER_WRITE_BIT, VK_ACCESS_SHADER_READ_BIT,
+-                           VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+-                           VK_PIPELINE_STAGE_VERTEX_SHADER_BIT);
+-        });
++            if (!batched) {
++                memory_barrier(VK_ACCESS_SHADER_WRITE_BIT, VK_ACCESS_SHADER_READ_BIT,
++                               VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
++                               VK_PIPELINE_STAGE_VERTEX_SHADER_BIT);
++            }
++            };
++        };
++        // EDEN_MAC_MESH_BATCH: in the active pass's prologue, unless the dispatch could read what
++        // the pass drew so far (its render targets, storage or transform feedback writes: the
++        // scheduler checks those) or must wait for its pipeline.
++        if (!IsBuilt() || mesh_samples_render_target ||
++            !scheduler.RecordInRenderPassPrologue(texture_cache.GetFramebuffer(),
++                                                  make_dispatch(true))) {
++            scheduler.RequestOutsideRenderPassOperationContext();
++            if (!IsBuilt()) {
++                scheduler.Record([this](vk::CommandBuffer) { build->Wait(!worker_only_build); });
++            }
++            scheduler.Record(make_dispatch(false));
++        }
+     }
+     scheduler.RequestRenderpass(texture_cache.GetFramebuffer());
+     if (writes_storage) {
+         scheduler.NoteRenderPassStores();
+     }
++    if (maxwell3d->regs.transform_feedback_enabled != 0) {
++        scheduler.NoteRenderPassWrites();
++    }
+     if (!IsBuilt()) {
+         // Wait for the pipeline to be built
+         scheduler.Record([this](vk::CommandBuffer) {
+@@ -1022,7 +1048,8 @@ bool GraphicsPipeline::ConfigureDraw(const RescalingPushConstant& rescaling,
+                       descriptor_buffer_offset, descriptor_buffer_chunk, bind_descriptor_buffer,
+                       rescaling_data = rescaling.Data(), is_rescaling, update_rescaling,
+                       uses_render_area = render_area.uses_render_area,
+-                      render_area_data = render_area.words](vk::CommandBuffer cmdbuf) {
++                      render_area_data = render_area.words,
++                      mesh_descriptor_set](vk::CommandBuffer cmdbuf) {
+         if (bind_descriptor_buffer) {
+             const VkDescriptorBufferBindingInfoEXT binding_info{
+                 descriptor_buffer_ring.BindingInfo(descriptor_buffer_chunk)};
+@@ -1059,9 +1086,9 @@ bool GraphicsPipeline::ConfigureDraw(const RescalingPushConstant& rescaling,
+         }
+         if (mesh_emulation) {
+             // The set the emulation's dispatch committed (see above).
+-            if (mesh_descriptor_set) {
++            if (*mesh_descriptor_set) {
+                 cmdbuf.BindDescriptorSets(VK_PIPELINE_BIND_POINT_GRAPHICS, *pipeline_layout, 0,
+-                                          mesh_descriptor_set, nullptr);
++                                          *mesh_descriptor_set, nullptr);
+             }
+             return;
+         }
+diff --git a/src/video_core/renderer_vulkan/vk_graphics_pipeline.h b/src/video_core/renderer_vulkan/vk_graphics_pipeline.h
+index 8d94100..4cc0dda 100644
+--- a/src/video_core/renderer_vulkan/vk_graphics_pipeline.h
++++ b/src/video_core/renderer_vulkan/vk_graphics_pipeline.h
+@@ -340,7 +340,7 @@ private:
+     std::optional<MeshEmulationSetup> mesh_emulation;
+     vk::ShaderModule mesh_vertex_module;
+     vk::Pipeline mesh_compute_pipeline;
+-    VkDescriptorSet mesh_descriptor_set{}; ///< shared by the dispatch and the draw it feeds
++    bool mesh_samples_render_target{}; ///< this draw samples one of its render targets
+     VkBuffer mesh_output_buffer{};
+     VkDeviceSize mesh_output_offset{};
+     VkDeviceSize mesh_output_size{};
+diff --git a/src/video_core/renderer_vulkan/vk_scheduler.cpp b/src/video_core/renderer_vulkan/vk_scheduler.cpp
+index 19bbcd9..d8ddb94 100644
+--- a/src/video_core/renderer_vulkan/vk_scheduler.cpp
++++ b/src/video_core/renderer_vulkan/vk_scheduler.cpp
+@@ -147,6 +147,14 @@ Scheduler::Scheduler(const Device& device_, StateTracker& state_tracker_)
+         }
+     }
+ 
++    // EDEN_MAC_MESH_BATCH=1 (MoltenVK): mesh emulation dispatches go in the pass's prologue
++    // instead of ending the pass (RecordInRenderPassPrologue); each Metal pass reloads and
++    // stores its tiles.
++    mesh_batch = device.IsMoltenVK() && std::getenv("EDEN_MAC_MESH_BATCH") != nullptr;
++    if (mesh_batch) {
++        LOG_INFO(Render_Vulkan, "EDEN_MAC_MESH_BATCH: mesh emulation dispatches batched before "
++                                "their render pass");
++    }
+     AcquireNewChunk();
+     AllocateWorkerCommandBuffer();
+     worker_thread = std::jthread([this](std::stop_token token) { WorkerThread(token); });
+@@ -296,6 +304,8 @@ void Scheduler::DispatchWork() {
+             event_cv.notify_all();
+         }
+         AcquireNewChunk();
++        // The pass's begin may have gone with it: its prologue can no longer grow.
++        prologue_open = false;
+     }
+ }
+ 
+@@ -322,6 +332,11 @@ void Scheduler::BeginRenderPassImpl(const Framebuffer* framebuffer, VkRenderPass
+         values[i] = clear_values[i];
+     }
+     const bool after_compute = std::exchange(compute_writes_pending, false);
++    // The prologue goes right before the begin (DispatchWork closes it if the begin lands in a
++    // new chunk).
++    prologue_last = chunk->Last();
++    prologue_open = mesh_batch;
++    prologue_used = false;
+     Record([renderpass, framebuffer_handle, render_area, values, clear_value_count,
+             after_compute](vk::CommandBuffer cmdbuf) {
+         const VkRenderPassBeginInfo renderpass_bi{
+@@ -444,6 +459,55 @@ void Scheduler::RequestRenderpass(const Framebuffer* framebuffer, std::source_lo
+     BeginRenderPassImpl(framebuffer, renderpass, nullptr, 0);
+ }
+ 
++bool Scheduler::OpenRenderPassPrologue(const Framebuffer* framebuffer) {
++    // The same pass RequestRenderpass would keep.
++    if (!prologue_open || !state.renderpass || deferred_clear.framebuffer != nullptr ||
++        framebuffer->RenderPass() != state.renderpass ||
++        framebuffer->Handle() != state.framebuffer ||
++        framebuffer->RenderArea().width != state.render_area.width ||
++        framebuffer->RenderArea().height != state.render_area.height) {
++        return false;
++    }
++    if (prologue_used) {
++        return true;
++    }
++    // [earlier commands] [from_earlier] [prologue commands...] [into_pass] [begin]: one barrier
++    // orders what came before the pass (graphics, compute, copies) before the prologue's
++    // dispatches, one orders their writes before the pass's vertex and indirect reads.
++    auto into_pass = [](vk::CommandBuffer cmdbuf, vk::CommandBuffer) {
++        const VkMemoryBarrier barrier{
++            .sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER,
++            .pNext = nullptr,
++            .srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT,
++            .dstAccessMask = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_INDIRECT_COMMAND_READ_BIT,
++        };
++        cmdbuf.PipelineBarrier(VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
++                               VK_PIPELINE_STAGE_VERTEX_SHADER_BIT |
++                                   VK_PIPELINE_STAGE_DRAW_INDIRECT_BIT,
++                               0, barrier);
++    };
++    auto from_earlier = [](vk::CommandBuffer cmdbuf, vk::CommandBuffer) {
++        const VkMemoryBarrier barrier{
++            .sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER,
++            .pNext = nullptr,
++            .srcAccessMask = VK_ACCESS_MEMORY_WRITE_BIT,
++            .dstAccessMask = VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT,
++        };
++        cmdbuf.PipelineBarrier(vk::PIPELINE_STAGE_GRAPHICS_COMPUTE_TRANSFER,
++                               VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, barrier);
++    };
++    // into_pass alone (from_earlier did not fit) is a harmless extra barrier.
++    Command* lead{};
++    if (!chunk->RecordAfter(prologue_last, into_pass) ||
++        !(lead = chunk->RecordAfter(prologue_last, from_earlier))) {
++        prologue_open = false;
++        return false;
++    }
++    prologue_last = lead;
++    prologue_used = true;
++    return true;
++}
++
+ void Scheduler::RequestOutsideRenderPassOperationContext(std::source_location location) {
+     if (state.renderpass) {
+         CountRenderPassEnd(location.file_name(), location.line());
+@@ -877,6 +941,7 @@ void Scheduler::EndRenderPass()
+         ++recording_epoch;
+         fragment_barrier.Reset();
+         render_pass_has_stores = false;
++        prologue_open = false;
+ 
+         query_cache->CounterClose(VideoCommon::QueryType::StreamingByteCount);
+ 
+diff --git a/src/video_core/renderer_vulkan/vk_scheduler.h b/src/video_core/renderer_vulkan/vk_scheduler.h
+index f977051..8582ba8 100644
+--- a/src/video_core/renderer_vulkan/vk_scheduler.h
++++ b/src/video_core/renderer_vulkan/vk_scheduler.h
+@@ -129,12 +129,28 @@ public:
+ 
+     void NoteRenderPassStores() {
+         render_pass_has_stores = true;
++        prologue_open = false;
+     }
+ 
+     bool RenderPassHasStores() const {
+         return render_pass_has_stores;
+     }
+ 
++    /// A draw in the active pass wrote memory a later command may read (transform feedback).
++    void NoteRenderPassWrites() {
++        prologue_open = false;
++    }
++
++    /// EDEN_MAC_MESH_BATCH=1 (MoltenVK): records `c`, which must be valid outside a render pass,
++    /// in the active pass's prologue: just before the pass began, after the other prologue
++    /// commands, between one barrier from earlier work and one into the pass's vertex/indirect
++    /// reads. The pass then keeps going instead of ending for `c`. False, recording nothing, when
++    /// `framebuffer` would not keep the active pass, the pass's begin already went to the worker,
++    /// or a draw in the pass wrote storage or transform feedback: `c` could read those writes.
++    template <typename T>
++        requires std::is_invocable_v<T, vk::CommandBuffer>
++    bool RecordInRenderPassPrologue(const Framebuffer* framebuffer, T&& c);
++
+     /// A dispatch was recorded: the next render pass must see what it wrote.
+     void NoteComputeWrites() {
+         compute_writes_pending = true;
+@@ -375,6 +391,36 @@ private:
+             return true;
+         }
+ 
++        /// Like Record, but links the command right after `after` (first when null), which must
++        /// be a command of this chunk. Returns the command, or null when the chunk is full.
++        template <typename T>
++        Command* RecordAfter(Command* after, T& command) {
++            using FuncType = TypedCommand<T>;
++            static_assert(sizeof(FuncType) < sizeof(data), "Lambda is too large");
++
++            const size_t offset = Common::AlignUp(command_offset, alignof(FuncType));
++            if (offset > sizeof(data) - sizeof(FuncType)) {
++                return nullptr;
++            }
++            Command* const inserted = new (data.data() + offset) FuncType(std::move(command));
++            command_offset = offset + sizeof(FuncType);
++            if (after) {
++                inserted->SetNext(after->GetNext());
++                after->SetNext(inserted);
++            } else {
++                inserted->SetNext(first);
++                first = inserted;
++            }
++            if (after == last) {
++                last = inserted;
++            }
++            return inserted;
++        }
++
++        Command* Last() const {
++            return last;
++        }
++
+         void MarkSubmit() {
+             submit = true;
+         }
+@@ -440,6 +486,9 @@ private:
+ 
+     void EndRenderPass();
+ 
++    /// RecordInRenderPassPrologue's checks; puts the prologue's two barriers in on first use.
++    bool OpenRenderPassPrologue(const Framebuffer* framebuffer);
++
+     void AcquireNewChunk();
+ 
+     const Device& device;
+@@ -448,6 +497,13 @@ private:
+     std::unique_ptr<MasterSemaphore> master_semaphore;
+     FragmentBarrierState fragment_barrier;
+     bool render_pass_has_stores{};
++    // EDEN_MAC_MESH_BATCH: the active pass's prologue (RecordInRenderPassPrologue). Commands go
++    // after `prologue_last` (the chunk's front when null) while `prologue_open`; `prologue_used`
++    // once its barriers are in.
++    bool mesh_batch{};
++    bool prologue_open{};
++    bool prologue_used{};
++    Command* prologue_last{};
+     bool compute_writes_pending{};
+     bool graphics_pipeline_missing{};
+     std::unique_ptr<CommandPool> command_pool;
+@@ -524,4 +580,20 @@ private:
+     u64 frame_counter{};
+ };
+ 
++template <typename T>
++    requires std::is_invocable_v<T, vk::CommandBuffer>
++bool Scheduler::RecordInRenderPassPrologue(const Framebuffer* framebuffer, T&& c) {
++    if (!OpenRenderPassPrologue(framebuffer)) {
++        return false;
++    }
++    auto command = [c = std::move(c)](vk::CommandBuffer cmdbuf, vk::CommandBuffer) { c(cmdbuf); };
++    Command* const inserted = chunk->RecordAfter(prologue_last, command);
++    if (!inserted) {
++        prologue_open = false;
++        return false;
++    }
++    prologue_last = inserted;
++    return true;
++}
++
+ } // namespace Vulkan
