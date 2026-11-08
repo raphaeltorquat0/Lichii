@@ -1,8 +1,8 @@
 diff --git a/src/video_core/renderer_opengl/gl_buffer_cache.h b/src/video_core/renderer_opengl/gl_buffer_cache.h
-index 831ec09..a7a7963 100644
+index 831ec09..31d8ae3 100644
 --- a/src/video_core/renderer_opengl/gl_buffer_cache.h
 +++ b/src/video_core/renderer_opengl/gl_buffer_cache.h
-@@ -94,6 +94,13 @@ public:
+@@ -94,6 +94,15 @@ public:
      void PostCopyBarrier();
      void Finish();
  
@@ -12,6 +12,8 @@ index 831ec09..a7a7963 100644
 +    }
 +
 +    void WaitSubmittedTick(u64) {}
++
++    void Wait(u64) {}
 +
      void TickFrame(Common::SlotVector<Buffer>&) noexcept {}
  
