@@ -1,0 +1,220 @@
+diff --git a/dist/nx2_switches.txt b/dist/nx2_switches.txt
+index f11b99a..063fafd 100644
+--- a/dist/nx2_switches.txt
++++ b/dist/nx2_switches.txt
+@@ -58,13 +58,18 @@ EDEN_NX2_FENCE_BATCH=1
+ # on a CPU-released semaphore (Ocarina of Time, most of every frame).
+ #EDEN_NX2_ACQUIRE_NODRAIN=1
+ 
+-# Texture cache collector: at most this many microseconds per frame (unset: unlimited, Eden's
+-# behaviour). It stops once the time is spent and goes on from the oldest image next frame; a
+-# collection begun at the expected threshold keeps going down to a band under it before it rests;
+-# and an image the GPU wrote (downloaded first, behind a full GPU wait) is evicted at most once
+-# every 30 frames unless an allocation failed. Ocarina of Time on the Steam Deck spent 10-12 ms
+-# of every frame (peaks of 37-72 ms) in the collector, on the GPU thread inside the present
+-# (EDEN_DKB_FRAME_TRACE=1: "DKB tick ... texture_cache_ms=sum/max tc_gc_deletes= tc_gc_downloads=").
++# Texture cache collector under its critical threshold: at most this many microseconds per frame
++# (unset: unlimited, Eden's behaviour), after at least 2 deletions. It stops once the time is
++# spent and goes on from the oldest image next frame; a collection begun at the expected
++# threshold keeps going down to a band under it before it rests; and an image the GPU wrote
++# (downloaded first, behind a full GPU wait) is evicted at most once every 30 frames. At or past
++# critical, or when an image did not fit, the collector runs unbounded as before until the use is
++# back under: textures first, GPU-written images only if that was not enough. Ocarina of Time on
++# the Steam Deck spent 10-12 ms of every frame (peaks of 37-72 ms) in the collector, on the GPU
++# thread inside the present; with the budget applied past critical too, it stopped evicting and
++# the process grew until earlyoom killed it. EDEN_DKB_FRAME_TRACE=1 prints per second:
++# "DKB tick ... texture_cache_ms=sum/max tc_gc_deletes= tc_gc_downloads= tc_gc_examined=
++# tc_gc_critical_frames= tc_gc_budget_stops= tc_used_mib= tc_image_mib=".
+ #EDEN_NX2_TC_GC_BUDGET_US=1000
+ 
+ # =0: the collector counts its own images instead of reading the driver's device memory usage,
+diff --git a/src/video_core/renderer_vulkan/vk_rasterizer.cpp b/src/video_core/renderer_vulkan/vk_rasterizer.cpp
+index b175772..3e01ec9 100644
+--- a/src/video_core/renderer_vulkan/vk_rasterizer.cpp
++++ b/src/video_core/renderer_vulkan/vk_rasterizer.cpp
+@@ -2964,6 +2964,13 @@ void RasterizerVulkan::TickFrame() {
+         if (tick_trace) {
+             trace_tick_gc[0] += gc.deletes;
+             trace_tick_gc[1] += gc.downloads;
++            trace_tick_gc[2] += gc.examined;
++            trace_tick_gc[3] += gc.critical_frames;
++            trace_tick_gc[4] += gc.budget_stops;
++            if (gc.used_mib != 0) {
++                trace_tick_gc[5] = gc.used_mib;
++                trace_tick_gc[6] = gc.image_mib;
++            }
+         }
+     }
+     mark(5);
+@@ -2985,12 +2992,14 @@ void RasterizerVulkan::TickFrame() {
+                      "DKB tick frames={} pipeline_ms={:.3f}/{:.3f} descriptors_ms={:.3f}/{:.3f} "
+                      "fences_ms={:.3f}/{:.3f} staging_ms={:.3f}/{:.3f} "
+                      "texture_cache_ms={:.3f}/{:.3f} buffer_cache_ms={:.3f}/{:.3f} (sum/max) "
+-                     "tc_gc_deletes={} tc_gc_downloads={}",
++                     "tc_gc_deletes={} tc_gc_downloads={} tc_gc_examined={} "
++                     "tc_gc_critical_frames={} tc_gc_budget_stops={} tc_used_mib={} tc_image_mib={}",
+                      trace_tick_frames, trace_tick_sum_ms[0], trace_tick_max_ms[0],
+                      trace_tick_sum_ms[1], trace_tick_max_ms[1], trace_tick_sum_ms[2],
+                      trace_tick_max_ms[2], trace_tick_sum_ms[3], trace_tick_max_ms[3],
+                      trace_tick_sum_ms[4], trace_tick_max_ms[4], trace_tick_sum_ms[5],
+-                     trace_tick_max_ms[5], trace_tick_gc[0], trace_tick_gc[1]);
++                     trace_tick_max_ms[5], trace_tick_gc[0], trace_tick_gc[1], trace_tick_gc[2],
++                     trace_tick_gc[3], trace_tick_gc[4], trace_tick_gc[5], trace_tick_gc[6]);
+             trace_tick_gc.fill(0);
+             trace_tick_sum_ms.fill(0.0);
+             trace_tick_max_ms.fill(0.0);
+diff --git a/src/video_core/renderer_vulkan/vk_rasterizer.h b/src/video_core/renderer_vulkan/vk_rasterizer.h
+index 227c064..102ca9b 100644
+--- a/src/video_core/renderer_vulkan/vk_rasterizer.h
++++ b/src/video_core/renderer_vulkan/vk_rasterizer.h
+@@ -387,8 +387,10 @@ private:
+     std::array<double, 6> trace_tick_sum_ms{};
+     std::array<double, 6> trace_tick_max_ms{};
+     u64 trace_tick_frames{};
+-    /// Texture cache collector per second: images deleted, of them downloaded first (GPU waits).
+-    std::array<u64, 2> trace_tick_gc{};
++    /// Texture cache collector per second: images deleted, of them downloaded first (GPU waits),
++    /// candidates examined, collections at critical, collections cut by the budget; then the last
++    /// device memory in use and image memory (MiB).
++    std::array<u64, 7> trace_tick_gc{};
+     std::optional<Common::DkbCpuTrace::Snapshot> trace_cpu_snapshot;
+     u64 trace_cpu_frame{};
+     bool trace_sample_frame{true};
+diff --git a/src/video_core/texture_cache/texture_cache.h b/src/video_core/texture_cache/texture_cache.h
+index 7b52883..78eabd6 100644
+--- a/src/video_core/texture_cache/texture_cache.h
++++ b/src/video_core/texture_cache/texture_cache.h
+@@ -142,17 +142,26 @@ void TextureCache<P>::RunGarbageCollector(bool out_of_memory) {
+     bool evict_old_costly = false;
+     u64 ticks_to_destroy = 0;
+     size_t num_iterations = 0;
+-    // EDEN_NX2_TC_GC_BUDGET_US=<us>: the collector stops once this much time is spent and goes on
+-    // from the oldest image next frame; while it is set, an image the GPU wrote is evicted
+-    // (downloaded first, behind a full GPU wait) at most once per GcDownloadInterval frames unless
+-    // an allocation failed, and a collection begun at expected_memory keeps going down to a band
+-    // under it before it rests, so the next frame's uploads do not start it again at once.
+-    // Ocarina of Time on the Steam Deck: 10-12 ms of every frame, peaks of 37-72 ms, in here.
++    // EDEN_NX2_TC_GC_BUDGET_US=<us>: under critical_memory the collector stops once this much time
++    // is spent (after GcMinDeletes deletions, so it always makes progress) and goes on from the
++    // oldest image next frame; an image the GPU wrote is evicted (downloaded first, behind a full
++    // GPU wait) at most once per GcDownloadInterval frames; and a collection begun at
++    // expected_memory keeps going down to a band under it before it rests, so the next frame's
++    // uploads do not start it again at once. At or past critical_memory, or when an image did not
++    // fit, none of this applies: memory matters more than the frame, and the collector runs as it
++    // always did until the use is back under -- textures first (no GPU wait), GPU-written images
++    // only if that was not enough. Ocarina of Time on the Steam Deck: 10-12 ms of every frame,
++    // peaks of 37-72 ms, in here; with the budget over every regime it deleted nothing while the
++    // process grew to 6 GB of RSS and earlyoom killed it.
+     static const u64 budget_ns = [] {
+         const char* value = std::getenv("EDEN_NX2_TC_GC_BUDGET_US");
+         return value != nullptr ? std::strtoull(value, nullptr, 10) * 1000ULL : 0ULL;
+     }();
+-    const u64 start_ns = budget_ns != 0 ? Nx2Profile::Now() : 0;
++    const bool critical = out_of_memory || total_used_memory >= critical_memory;
++    const bool budgeted = budget_ns != 0 && !critical;
++    const u64 start_ns = budgeted ? Nx2Profile::Now() : 0;
++    size_t deleted = 0;
++    bool skip_downloads = false;
+     const u64 band =
+         budget_ns != 0
+             ? (std::min)(u64{256_MiB},
+@@ -174,14 +183,17 @@ void TextureCache<P>::RunGarbageCollector(bool out_of_memory) {
+         num_iterations = aggressive_mode ? 40 : (high_priority_mode ? 20 : 10);
+     };
+     const auto Cleanup = [this, &num_iterations, &high_priority_mode, &aggressive_mode,
+-                          &evict_old_costly, out_of_memory, start_ns, high_memory](ImageId image_id) {
++                          &evict_old_costly, &deleted, &skip_downloads, out_of_memory, budgeted,
++                          start_ns, high_memory](ImageId image_id) {
+         if (num_iterations == 0) {
+             return true;
+         }
+-        if (budget_ns != 0 && Nx2Profile::Now() - start_ns > budget_ns) {
++        if (budgeted && deleted >= GcMinDeletes && Nx2Profile::Now() - start_ns > budget_ns) {
++            ++gc_trace.budget_stops;
+             return true;
+         }
+         --num_iterations;
++        ++gc_trace.examined;
+         auto& image = slot_images[image_id];
+         if (True(image.flags & ImageFlagBits::IsDecoding)) {
+             return false;
+@@ -191,8 +203,8 @@ void TextureCache<P>::RunGarbageCollector(bool out_of_memory) {
+             (!high_priority_mode && must_download)) {
+             return false;
+         }
+-        if (must_download && budget_ns != 0 && !out_of_memory &&
+-            frame_tick < gc_next_download_frame) {
++        if (must_download &&
++            (skip_downloads || (budgeted && frame_tick < gc_next_download_frame))) {
+             return false;
+         }
+         if (must_download) {
+@@ -210,6 +222,7 @@ void TextureCache<P>::RunGarbageCollector(bool out_of_memory) {
+         }
+         ++(True(image.flags & ImageFlagBits::CostlyLoad) ? gc_costly_deletes : gc_deletes);
+         ++gc_trace.deletes;
++        ++deleted;
+         UnregisterImage(image_id);
+         DeleteImage(image_id, image.scale_tick > frame_tick + 5);
+         if (out_of_memory) {
+@@ -287,10 +300,24 @@ void TextureCache<P>::RunGarbageCollector(bool out_of_memory) {
+     }
+     Collect();
+     if (out_of_memory || total_used_memory >= critical_memory) {
++        // With EDEN_NX2_TC_GC_BUDGET_US set, textures first: deleting them costs no GPU wait. The
++        // GPU-written images (downloaded first, runtime.Finish) only if that did not bring the
++        // use back under critical_memory. Unset: one pass over the oldest images, as always.
+         Configure(true);
++        skip_downloads = budget_ns != 0;
+         Collect();
++        if (skip_downloads && (out_of_memory || total_used_memory >= critical_memory)) {
++            Configure(true);
++            skip_downloads = false;
++            Collect();
++        }
+     }
+     gc_high_armed = budget_ns != 0 && high_priority_mode;
++    if (critical) {
++        ++gc_trace.critical_frames;
++    }
++    gc_trace.used_mib = total_used_memory >> 20;
++    gc_trace.image_mib = last_image_bytes >> 20;
+ }
+ 
+ template <class P>
+@@ -368,6 +395,13 @@ void TextureCache<P>::TickFrame() {
+                 }
+             }
+             if (native_thresholds_applied && budget_check_frames++ % 30 == 0) {
++                // What the collector can actually free, for the DKB tick trace (the rest of the
++                // device memory in use is buffers, staging and, on an APU, whatever else the
++                // driver counts in the heap: upstream #739).
++                last_image_bytes = 0;
++                for (const auto [image_id, image] : slot_images) {
++                    last_image_bytes += ImageMemoryBytes(*image);
++                }
+                 const u64 budget = runtime.GetDeviceMemoryBudget();
+                 if (budget > 2_GiB) {
+                     const u64 old_critical = critical_memory;
+diff --git a/src/video_core/texture_cache/texture_cache_base.h b/src/video_core/texture_cache/texture_cache_base.h
+index 60c1785..0ab7ebc 100644
+--- a/src/video_core/texture_cache/texture_cache_base.h
++++ b/src/video_core/texture_cache/texture_cache_base.h
+@@ -132,8 +132,17 @@ class TextureCache : public VideoCommon::ChannelSetupCaches<TextureCacheChannelI
+     struct GcTrace {
+         u64 deletes{};
+         u64 downloads{};
++        u64 examined{};        ///< Candidates the collector looked at (kept or deleted)
++        u64 critical_frames{}; ///< Collections at or past critical_memory (budget not applied)
++        u64 budget_stops{};    ///< Collections cut short by EDEN_NX2_TC_GC_BUDGET_US
++        u64 used_mib{};        ///< total_used_memory after the last collection
++        u64 image_mib{};       ///< Memory of the live images (last 30-frame count)
+     };
+     GcTrace gc_trace;
++    u64 last_image_bytes{};
++    /// EDEN_NX2_TC_GC_BUDGET_US: deletions a collection under critical_memory always gets before
++    /// the time budget can stop it (progress whatever the clock says).
++    static constexpr size_t GcMinDeletes = 2;
+     /// EDEN_NX2_TC_GC_BUDGET_US: a collection begun at expected_memory goes on down to a band
+     /// under it before it rests (RunGarbageCollector).
+     bool gc_high_armed{};
