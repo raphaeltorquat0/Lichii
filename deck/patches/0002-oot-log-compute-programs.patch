@@ -1,0 +1,31 @@
+--- a/src/video_core/engines/kepler_compute.cpp	2026-11-08 00:14:09
++++ b/src/video_core/engines/kepler_compute.cpp	2026-11-08 00:14:09
+@@ -5,6 +5,8 @@
+ // SPDX-License-Identifier: GPL-2.0-or-later
+ 
+ #include <algorithm>
++#include <mutex>
++#include <set>
+ #include <atomic>
+ #include <bit>
+ #include <bitset>
+@@ -911,6 +913,19 @@
+     if (!BypassEnabled(program_id)) {
+         return false;
+     }
++    // Steam Deck build, diagnostic: each native compute program once, with its grid, to find the
++    // network's passes at other resolutions (the keys below were taken at 1x with Max Resolution).
++    {
++        static std::mutex seen_mutex;
++        static std::set<u64> seen;
++        std::scoped_lock lock{seen_mutex};
++        if (seen.insert(native_key).second) {
++            LOG_INFO(HW_GPU, "Ocarina of Time: native compute program {:#x} grid {}x{}x{} block {}x{}x{}",
++                     native_key, launch_description.grid_dim_x, launch_description.grid_dim_y,
++                     launch_description.grid_dim_z, launch_description.block_dim_x,
++                     launch_description.block_dim_y, launch_description.block_dim_z);
++        }
++    }
+     auto* const state = rasterizer->OotNetworkBypass();
+     if (!state) {
+         return false;
