@@ -21,6 +21,10 @@ on:
         description: Apply deck/patches/ (off = pure upstream build, for A/B against our patches)
         type: boolean
         default: true
+      patch_dir:
+        description: Directory of patches inside this repository (default deck/patches; e.g. deck/patches-head for the upstream HEAD series)
+        required: false
+        default: deck/patches
   schedule:
     - cron: "17 */6 * * *"
 
@@ -108,18 +112,20 @@ jobs:
         shell: bash
         env:
           PATCHES: ${{ inputs.patches }}
+          PATCH_DIR: ${{ inputs.patch_dir }}
         run: |
           set -euo pipefail
+          dir="fork/${PATCH_DIR:-deck/patches}"
           if [ "${PATCHES:-true}" = "false" ]; then
             echo "(no patches: pure upstream build)" > applied-patches.txt
             exit 0
           fi
-          for p in fork/deck/patches/*.patch; do
+          for p in "$dir"/*.patch; do
             echo "applying $p"
             git apply --check "$p"
             git apply "$p"
           done
-          ls fork/deck/patches/*.patch | xargs -n1 basename > applied-patches.txt
+          { echo "from ${PATCH_DIR:-deck/patches}:"; ls "$dir"/*.patch | xargs -n1 basename; } > applied-patches.txt
 
       - name: Install dependencies
         shell: bash
@@ -246,7 +252,7 @@ jobs:
             gh release delete "deck-$NUMBER" -R "$GITHUB_REPOSITORY" -y --cleanup-tag || true
           fi
           notes="zortos293/Lichii $NUMBER (${SHA}) compiled with clang $PGO_LLVM_VERSION, the upstream eglantine.profdata PGO profile and -march=znver2 -mtune=znver2 for the Steam Deck's Zen 2 CPU."
-          notes="$notes"$'\n\n'"Patches (deck/patches/):"$'\n'"$(sed 's/^/- /' applied-patches.txt)"
+          notes="$notes"$'\n\n'"Patches:"$'\n'"$(sed 's/^/- /' applied-patches.txt)"
           gh release create "deck-$NUMBER" "$ASSET" -R "$GITHUB_REPOSITORY" \
             --title "Lichii for Steam Deck, build $NUMBER (${SHA::7})" \
             --notes "$notes"
