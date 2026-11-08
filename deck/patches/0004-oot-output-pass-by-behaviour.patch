@@ -1,0 +1,87 @@
+--- a/src/video_core/oot_network.h	2026-11-08 00:14:09
++++ b/src/video_core/oot_network.h	2026-11-08 01:33:13
+@@ -49,6 +49,12 @@
+     /// Render target 0 of the latest tonemap draw (address 0 until one is seen), under mutex.
+     Tegra::Engines::Maxwell3D::Regs::RenderTargetConfig tonemapped{};
+     std::atomic<bool> output_replaced{}; ///< the latest output pass was replaced
++    // Steam Deck build: at the game's dynamic resolutions the heavy dispatch and the output pass run
++    // as other native programs, so the output pass is recognised by what it writes (first dispatch
++    // after the network whose cb0 image is a B10G11R11 image of the tonemapped size) and the
++    // dispatches between the prepass and the network are skipped by position, at most `skip_budget`.
++    std::atomic<bool> after_network{};
++    std::atomic<s32> skip_budget{};
+ };
+ 
+ inline bool BypassEnabled(u64 program_id) {
+--- a/src/video_core/engines/kepler_compute.cpp	2026-11-08 00:14:47
++++ b/src/video_core/engines/kepler_compute.cpp	2026-11-08 01:33:13
+@@ -942,21 +942,43 @@
+     if (tonemapped.Address() == 0) {
+         return false;
+     }
+-    if (native_key == PrepassProgramKey || native_key == HeavyDispatchProgramKey ||
+-        native_key == NetworkProgramKey) {
+-        return state->output_replaced.load(std::memory_order_relaxed);
++    const bool replaced_before = state->output_replaced.load(std::memory_order_relaxed);
++    if (native_key == PrepassProgramKey) {
++        // Frame boundary of the network: the prepass comes first every frame.
++        state->after_network.store(false, std::memory_order_relaxed);
++        state->skip_budget.store(replaced_before ? 2 : 0, std::memory_order_relaxed);
++        return replaced_before;
+     }
+-    if (native_key != OutputProgramKey) {
++    if (native_key == NetworkProgramKey) {
++        state->after_network.store(true, std::memory_order_relaxed);
++        state->skip_budget.store(0, std::memory_order_relaxed);
++        return replaced_before;
++    }
++    if (native_key == HeavyDispatchProgramKey) {
++        return replaced_before;
++    }
++    if (!state->after_network.load(std::memory_order_relaxed)) {
++        // Between the prepass and the network (the heavy dispatch, whatever its key here).
++        const s32 budget = state->skip_budget.load(std::memory_order_relaxed);
++        if (replaced_before && budget > 0) {
++            state->skip_budget.store(budget - 1, std::memory_order_relaxed);
++            return true;
++        }
+         return false;
+     }
+-    // The copy needs the tonemapped image to be a B10G11R11 block-linear image of the output's size.
++    // After the network: the output pass is the first dispatch that writes a B10G11R11 block-linear
++    // image of the tonemapped image's size (handle at cb0+0xd0), whatever its program key.
+     const auto output = ConstBuffer0Image(OutputImageHandleOffset);
+     if (!output || output->format != Texture::TextureFormat::B10G11R11 || output->Address() == 0 ||
+         output->Address() == tonemapped.Address() || !output->IsBlockLinear() ||
+         tonemapped.format != Tegra::RenderTargetFormat::B10G11R11_FLOAT ||
+         tonemapped.tile_mode.is_pitch_linear || tonemapped.width != output->Width() ||
+         tonemapped.height != output->Height()) {
++        if (native_key != OutputProgramKey) {
++            return false;
++        }
+         state->output_replaced.store(false, std::memory_order_relaxed);
++        state->after_network.store(false, std::memory_order_relaxed);
+         static bool warned = false;
+         if (!std::exchange(warned, true)) {
+             LOG_WARNING(HW_GPU,
+@@ -968,6 +990,7 @@
+         }
+         return false;
+     }
++    state->after_network.store(false, std::memory_order_relaxed);
+     Fermi2D::Surface destination{};
+     destination.format = Tegra::RenderTargetFormat::B10G11R11_FLOAT;
+     destination.linear = Fermi2D::MemoryLayout::BlockLinear;
+@@ -1005,9 +1028,10 @@
+     static bool logged = false;
+     if (!std::exchange(logged, true)) {
+         LOG_INFO(HW_GPU,
+-                 "Ocarina of Time: anti-aliasing network bypassed ({}): {:#x} -> {:#x} {}x{}",
++                 "Ocarina of Time: anti-aliasing network bypassed ({}): {:#x} -> {:#x} {}x{} (output "
++                 "program {:#x})",
+                  copied ? "copy of the tonemapped image" : "copy failed", tonemapped.Address(),
+-                 output->Address(), width, height);
++                 output->Address(), width, height, native_key);
+     }
+     return copied;
+ }
