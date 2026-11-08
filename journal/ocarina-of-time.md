@@ -260,17 +260,33 @@ Diagnóstico com as armadilhas de leitura desligadas (`EDEN_NX2_NO_REACTIVE=1`, 
 
 O `READ_COPY` com os tetos de memória já foi portado para o build do Mac e compilou; a medição vem a seguir. Depois dele, o alvo é o restante dos ~20 ms de GPU ociosa: a cadeia guest → frente → trás → MoltenVK, em que cada estágio fica em 50 a 60% e há pouca sobreposição entre quadros.
 
-### Onde paramos no Mac
+### `READ_COPY` e o perfil de espera
 
-| Mac, Kokiri | Sem correção | `EDEN_MAC_FAST_FP=1` |
+O `READ_COPY` portado para o Mac deu 16,9 fps, com o RSS estável em 1.286 MiB: nenhum ganho, como o teto das leituras reativas já indicava.
+
+O perfil das threads da GPU (COMB-PROF, 16,1 fps com o perfil ligado, ~62 ms por quadro) mostra onde o tempo se perde:
+
+| Thread | Onde espera | ms por quadro |
 |---|---|---|
-| Imagem de fábrica | 4,9 fps | 9,6 fps (~104 ms) |
-| Bypass do anti-aliasing | 5,9 fps | 19,4 fps (~52 ms, GPU 88%) |
+| Frente | dreno da thread de trás (`split drain`) | 20,0 |
+| Frente | listas de comando escritas pela GPU (`list GPU wait`, 5,2 listas, ~3 ms cada) | 15,8 |
+| Frente | escritor (`writer wait`) | 8,4 |
+| Trás | sem trabalho (`split wait`) | 25,0 |
 
-A correção está em `mac/patches/0001-mac-fast-fp.patch`, e o relatório completo do perfil, com 11 rodadas, em [`mac-gpu-report.md`](mac-gpu-report.md). Uma ressalva para comparar com o Deck: o Deck roda em resolução 3/4, ou seja, com ~56% dos pixels do Mac.
+O gargalo é o passo travado entre as threads da frente e de trás, o mesmo que limitou o Deck. Agora, porém, há GPU sobrando para aproveitar quando ele for destravado.
 
-A meta de 40 a 50 fps com a imagem de fábrica ainda não foi atingida. O que falta, em ordem de ganho:
+## Onde paramos (2026-11-08)
 
-1. **Tirar a rede de anti-aliasing do HMMA em software** (~53 ms por quadro). Ou um SPIRV-Cross que respeite o `DontInline`, compilado num MoltenVK local, ou um compute Metal próprio com `simdgroup_matrix` para os programas da rede.
-2. **Juntar os computes da emulação de mesh** num prólogo antes do render pass (até ~12 ms por quadro).
-3. **CPU do guest no Dynarmic**: não há NCE no macOS (`CMakeLists.txt:324`), e há ~10% em `ExclusiveMonitor::CheckAndClear`.
+| Mac M2 Pro, Kokiri, imagem de fábrica | fps |
+|---|---|
+| Sem correções | 4,9 |
+| `EDEN_MAC_FAST_FP=1` | 9,6 |
+| + `EDEN_MAC_NATIVE_NET` (rede de anti-aliasing por MSL próprio) | 17,2 |
+| + `EDEN_MAC_MESH_BATCH=1` | **17,5** |
+
+O que vale e o que não vale:
+
+- **Patches que contam:** `mac/patches/0001` (FAST_FP), `0004` (mesh em lote), `0005` (rede nativa e gerador dos kernels) e `0006` (porte do `READ_COPY`), todos sobre o PR #768 do upstream (`9c54010`).
+- **Descartados, com medição:** occlusion queries, barreira no HMMA, argument buffers desligados (quebravam a imagem), SPIRV-Cross com `noinline` global num MoltenVK 1.4.2 local (piorou) e `READ_COPY` (sem ganho no Mac).
+- **Próximo passo:** destravar o passo travado entre frente e trás. Os candidatos já existem na série do Deck (`deck/patches-head`: 0007, 0008, 0011, 0012): acquire sem dreno, espera por escritor e listas de comando. Medir cada um sobre o COMB.
+- **Meta:** 40 a 50 fps com a imagem de fábrica, ou seja, quadro de 20 a 25 ms. Hoje são ~57 ms, dos quais ~37 ms são de trabalho de GPU.
