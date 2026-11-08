@@ -174,6 +174,21 @@ A primeira hipótese era que o patch atingia outras funções além do HMMA. Nã
 
 Uma armadilha de método: com o cache de pipelines quente, o MoltenVK reaproveita o MSL antigo e o patch não entra. É preciso medir com o cache frio.
 
+### A rede de anti-aliasing em Metal nativo, marco 1
+
+O formato da rede ficou claro:
+
+- O HMMA do guest é o `mma.m16n8k16` da NVIDIA com acumulador f16. Cada lane guarda fragmentos A, B e C em `half2`, no layout padrão (`groupID = lane/4`, `k = 2*(lane%4)`).
+- O Lichii arredonda para f16 depois de cada grupo de K=8 (`emit_spirv_tensor.cpp:232-345`).
+- O kernel mais caro chama o HMMA 193 vezes.
+
+Uma revisão do trace do FAC-NOINL mudou a ordem do plano. Com o `noinline`, o encoder da rede caiu de ~53 para **~12 a 13 ms por quadro**. O quadro inteiro piorou por outros motivos: o MoltenVK 1.4.2 oficial e ~1.400 encoders pequenos de compute por quadro. Ou seja, o `noinline` resolve a rede. O que atrapalhou foi o resto da troca de MoltenVK.
+
+O plano novo usa o MoltenVK que vem no `.app` (o fork do Ryujinx 1.4.1). Ele aceita MSL direto no `vkCreateShaderModule` pelo número mágico `0x19960412` (`MVKShaderModule.mm:511`). Para os programas da rede, o Lichii troca o módulo SPIR-V por um MSL gerado do mesmo SPIR-V, idêntico exceto pelo HMMA marcado `noinline`. A matemática e os bindings não mudam.
+
+- **Fase 1:** `noinline` só no HMMA, só na rede.
+- **Fase 2:** o corpo do HMMA com `simdgroup_matrix` (quatro MACs 8x8x8 via scratch em threadgroup), com validação numérica.
+
 ### Onde paramos no Mac
 
 | Mac, Kokiri | Sem correção | `EDEN_MAC_FAST_FP=1` |
